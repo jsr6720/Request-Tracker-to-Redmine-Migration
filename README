@@ -1,0 +1,11 @@
+== Introduction
+
+This project was meant for transitioning from an RT based tracking system to Redmine.
+
+This script was tested with RT 3.8.4 and Redmine 1.0.4
+
+== LICENSE
+
+Licensed using the MIT (http://www.opensource.org/licenses/mit-license.php)
+
+Read: I don't care what you do, I just don't want to be liable for anything.
