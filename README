@@ -9,3 +9,14 @@ This script was tested with RT 3.8.4 and Redmine 1.0.4
 Licensed using the MIT (http://www.opensource.org/licenses/mit-license.php)
 
 Read: I don't care what you do, I just don't want to be liable for anything.
+
+== Targets for migrating
+
+See the configuration file for more information, but roughly:
+
+RT3					Redmine
+Tickets			=>	Issues
+Queues			=>	Projects (or attributes of projects)
+Custom Fields	=>	Issue Custom Fields
+Users			=>	Users
+Groups			=>	Groups
