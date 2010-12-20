@@ -18,6 +18,7 @@
 # includes
 require 'active_record' # db access
 require 'iconv' # setting char sets
+require 'pp'
 
 namespace :redmine do
   desc "Migrate from RT3 to Redmine"
@@ -74,17 +75,85 @@ namespace :redmine do
                       'developer' => developer_role
                       }
       
+      # MAP RT Custom fields to Redmine custom fields
+      CUSTOM_FIELD_MAPPING = { 'Select' => 'list'
+                              }
+      CUSTOM_FIELD_MAPPING.default = 'string' # if not found default to string type
+      
       
       # entry point for migrate script.
       def self.migrate
         establish_connection
         
-        # are we converting users?
-        # RT User = Redmine User
-        RTUsers.count
+        # quick DB test
+        RTUsers.count # fails out if not connected properly
         
-        puts "migrate me"
-      end
+        # what are we migrating
+        migrated_custom_values = 0
+        migrated_tickets = 0
+        migrated_ticket_attachments = 0
+        
+        puts 'migrating data'
+        # lets do a transaction
+        ActiveRecord::Base.transaction do
+          
+          # Plan of action (users added as-needed basis)
+          # == transfer the basic stuff
+          # * custom fields
+          # ** available values
+          # * Queues (map to projects)
+          # ** Tickets (map to issues)
+          # *** Convert transactions to messages
+          # *** Extract attatchments to file system
+          
+          # Custom fields
+          print "Migrating custom fields"
+          custom_field_map = {}
+          RTCustomFields.find_each do |field|
+            print '.'
+            STDOUT.flush
+            # Redmine custom field name
+            field_name = encode(field.Name[0, limit_for(IssueCustomField, 'name')]).humanize
+            # Find if the custom already exists in Redmine
+            f = IssueCustomField.find_by_name(field_name)
+            # Or create a new one
+            field_format = CUSTOM_FIELD_MAPPING[field.Type]
+            
+            f ||= IssueCustomField.create(:name => encode(field.Name[0, limit_for(IssueCustomField, 'name')]).humanize,
+                                          :field_format => encode(field_format))
+            
+            # get possible values if list based
+            if f.field_format.downcase == 'list'
+              field.customfieldvalues.find_each do |field_value|
+                f.possible_values = (f.possible_values + field_value.Name.scan(/^.*/)).flatten.compact.uniq
+              end
+            end
+            
+            next if f.new_record?
+            f.trackers = Tracker.find(:all)
+            f.projects << @target_project
+            custom_field_map[field.Name] = f
+          end
+          puts
+          
+          # set an RT ticket id field as a Redmine issue custom field.
+          r = IssueCustomField.find(:first, :conditions => { :name => "RT ID" })
+          # make it a string so it's searchable only add if it's not found
+          r ||= IssueCustomField.new(:name => 'RT ID',
+                                   :field_format => 'string',
+                                   :searchable => true,
+                                   :is_filter => true) if r.nil?
+          r.trackers = Tracker.find(:all)
+          # only add it to a project if it was newly created
+          if r.new_record?
+            r.projects << @target_project
+          end
+          r.save!
+          custom_field_map['RT ID'] = r
+        end ### end custom field
+        puts 'complete'
+        
+      end ### end self.migrate
       
       # make sure we have connections
       def self.establish_connection
@@ -107,12 +176,12 @@ namespace :redmine do
           puts "Unable to create a project with identifier '#{identifier}'!" unless project.save
           # enable issues and wiki for the created project
           project.enabled_module_names = ['issue_tracking', 'wiki']
-        else
-          puts
-          puts "This project already exists in your Redmine database."
-          print "Are you sure you want to append data to this project ? [Y/n] "
-          STDOUT.flush
-          exit if STDIN.gets.match(/^n$/i)
+#        else
+#          puts
+#          puts "This project already exists in your Redmine database."
+#          print "Are you sure you want to append data to this project ? [Y/n] "
+#          STDOUT.flush
+#          exit if STDIN.gets.match(/^n$/i)
         end
         project.trackers << TRACKER_BUG unless project.trackers.include?(TRACKER_BUG)
         project.trackers << TRACKER_FEATURE unless project.trackers.include?(TRACKER_FEATURE)
@@ -135,6 +204,14 @@ namespace :redmine do
            :schema_search_path => rt_db_schema
           }
         end
+      end
+      
+      # this allows going to the data source via Redmine models
+      # and getting the string length limit as set by database
+      # ie: limit_for(User, 'mail')
+      #     => 60
+      def self.limit_for(klass, attribute)
+        klass.columns_hash[attribute.to_s].limit
       end
       
       # Following are get/set for user collected prompts
@@ -216,11 +293,72 @@ namespace :redmine do
       def self.rt_db_path; "#{rt_directory}/db/rt.db" end
       def self.rt_attachments_directory; "#{rt_directory}/attachments" end
       
+      # when migrating tickets and other RT data lets create members if needed
+      def self.find_or_create_user(username, project_member = false)
+        return User.anonymous if username.blank?
+
+        u = User.find_by_login(username)
+        if !u
+          # Create a new user if not found
+          mail = username[0,limit_for(User, 'mail')]
+          if mail_attr = RTUsers.find_by_sid_and_name(username, 'email')
+            mail = mail_attr.value
+          end
+          mail = "#{mail}@foo.bar" unless mail.include?("@")
+
+          name = username
+          if name_attr = RTUsers.find_by_sid_and_name(username, 'name')
+            name = name_attr.value
+          end
+          name =~ (/(.*)(\s+\w+)?/)
+          fn = $1.strip
+          ln = ($2 || '-').strip
+
+          u = User.new :mail => mail.gsub(/[^-@a-z0-9\.]/i, '-'),
+                       :firstname => fn[0, limit_for(User, 'firstname')].gsub(/[^\w\s\'\-]/i, '-'),
+                       :lastname => ln[0, limit_for(User, 'lastname')].gsub(/[^\w\s\'\-]/i, '-')
+
+          u.login = username[0,limit_for(User, 'login')].gsub(/[^a-z0-9_\-@\.]/i, '-')
+          u.password = 'rt_user'
+          u.admin = true if TracPermission.find_by_username_and_action(username, 'admin')
+          # finally, a default user is used if the new user is not valid
+          u = User.find(:first) unless u.save
+        end
+        # Make sure he is a member of the project
+        if project_member && !u.member_of?(@target_project)
+          role = DEFAULT_ROLE
+          if u.admin
+            role = ROLE_MAPPING['admin']
+          elsif TracPermission.find_by_username_and_action(username, 'developer')
+            role = ROLE_MAPPING['developer']
+          end
+          Member.create(:user => u, :project => @target_project, :roles => [role])
+          u.reload
+        end
+        u
+      end # end find_or_create_user
+      
       
       # mapping active record classes to RT3
       class RTUsers < ActiveRecord::Base
         set_table_name :users
       end
+      
+      # RT's concept of custom fields
+      class RTCustomFields < ActiveRecord::Base
+        set_table_name :customfields
+        
+        has_many :customfieldvalues, :class_name => "RTCustomFieldValues", :foreign_key => :CustomField
+      end
+      
+      # each custom field has a list of values
+      class RTCustomFieldValues < ActiveRecord::Base
+        set_table_name :customfieldvalues
+        
+        belongs_to :rtcustomfields # foreign key - CustomField
+        
+      end
+      
       
       # create a mapping from standard RT3 elements to redmine
     
@@ -235,6 +373,14 @@ namespace :redmine do
     
     
       # RT Groups = Redmine Groups
+      
+      # encode to proper standard
+      private
+        def self.encode(text)
+          @ic.iconv text
+        rescue
+          text
+        end
     end #RTMigrate Module
     
     # lets make sure the user has a created database
@@ -272,20 +418,33 @@ namespace :redmine do
     # uses def prompt for getting/setting values
     # Don't think I need the directory
     # prompt('RT directory', :default => '/opt/rt3') {|directory| RTMigrate.set_rt_directory directory.strip}
-    prompt('RT database adapter (sqlite, sqlite3, mysql, postgresql)', :default => 'mysql') {|adapter| RTMigrate.set_rt_adapter adapter}
-    unless %w(sqlite sqlite3).include?(RTMigrate.rt_adapter)
-      # we need more info if it's not sqlite3
-      prompt('RT database host', :default => 'localhost') {|host| RTMigrate.set_rt_db_host host}
-      prompt('RT database port', :default => DEFAULT_PORTS[RTMigrate.rt_adapter]) {|port| RTMigrate.set_rt_db_port port}
-      prompt('RT database name', :default => 'rt3') {|name| RTMigrate.set_rt_db_name name}
-      prompt('RT database schema', :default => 'public') {|schema| RTMigrate.set_rt_db_schema schema}
-      prompt('RT database username') {|username| RTMigrate.set_rt_db_username username}
-      prompt('RT database password') {|password| RTMigrate.set_rt_db_password password}
-    end
-    prompt('RT database encoding', :default => 'UTF-8') {|encoding| RTMigrate.encoding encoding}
-    prompt('RT queue name') {|queue| RTMigrate.set_rt_queue queue}
-    prompt('Redmine target project identifier', :default => RTMigrate.get_rt_queue) {|identifier| RTMigrate.target_project_identifier identifier}
-    puts
+#    prompt('RT database adapter (sqlite, sqlite3, mysql, postgresql)', :default => 'mysql') {|adapter| RTMigrate.set_rt_adapter adapter}
+#    unless %w(sqlite sqlite3).include?(RTMigrate.rt_adapter)
+#      # we need more info if it's not sqlite3
+#      prompt('RT database host', :default => 'localhost') {|host| RTMigrate.set_rt_db_host host}
+#      prompt('RT database port', :default => DEFAULT_PORTS[RTMigrate.rt_adapter]) {|port| RTMigrate.set_rt_db_port port}
+#      prompt('RT database name', :default => 'rt3') {|name| RTMigrate.set_rt_db_name name}
+#      prompt('RT database schema', :default => 'public') {|schema| RTMigrate.set_rt_db_schema schema}
+#      prompt('RT database username', :default => 'rt') {|username| RTMigrate.set_rt_db_username username}
+#      prompt('RT database password') {|password| RTMigrate.set_rt_db_password password}
+#    end
+#    prompt('RT database encoding', :default => 'UTF-8') {|encoding| RTMigrate.encoding encoding}
+#    prompt('RT queue name', :default => 'general') {|queue| RTMigrate.set_rt_queue queue}
+#    prompt('Redmine target project identifier', :default => RTMigrate.get_rt_queue) {|identifier| RTMigrate.target_project_identifier identifier}
+#    puts
+    
+    # lets hardcode for now
+    puts 'hardcoded assignment'
+    RTMigrate.set_rt_adapter("mysql")
+    RTMigrate.set_rt_db_host("localhost")
+    RTMigrate.set_rt_db_port(3306)
+    RTMigrate.set_rt_db_name('rt3')
+    RTMigrate.set_rt_db_schema('public')
+    RTMigrate.set_rt_db_username('rt')
+    RTMigrate.set_rt_db_password('flower')
+    RTMigrate.encoding('UTF-8')
+    RTMigrate.set_rt_queue('general')
+    RTMigrate.target_project_identifier('general')
     
     # now lets do the migrate
     Setting.notified_events = [] # Turn off email notifications

@@ -1,12 +1,12 @@
 h1. RT Redmine Differences
 
-Copy this into redmine and bam instant documentation on rt 3.8.4 and redmine 1.0.4.
+*This uses Redmine's wiki format. Copy into a wiki page to see it stylized*
 
 {{>toc}}
 
 h2. Introduction
 
-This page is more about the general features in Redmine vs. RT, not a comparison of custom variables, or configuration options.
+This page is more about the general features in Redmine vs. RT, not a comparison of custom variables, or configuration options. This is not an exhaustive list; this was written as a simple comparison of basic feature sets between Request Tracker 3.8.4 and Redmine 1.0.4.
 
 h2. Features unique to Redmine
 
