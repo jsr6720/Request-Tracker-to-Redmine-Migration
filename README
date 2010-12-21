@@ -4,6 +4,12 @@ This project was meant for transitioning from an RT based tracking system to Red
 
 This script was tested with RT 3.8.4 and Redmine 1.0.4
 
+== Usage
+
+Copy migrate_from_rt3.rake into the {redmine}/lib/tasks directory (with the other rake tasks).
+
+execute $rake redmine:migrate_from_rt3 RAILS_ENV={production/development/test}
+
 == LICENSE
 
 Licensed using the MIT (http://www.opensource.org/licenses/mit-license.php)

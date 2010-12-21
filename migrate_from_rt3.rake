@@ -105,6 +105,7 @@ namespace :redmine do
           # ** Tickets (map to issues)
           # *** Convert transactions to messages
           # *** Extract attatchments to file system
+          # *** RT links => Redmine issue_relations
           
           # Custom fields
           print "Migrating custom fields"
@@ -150,7 +151,101 @@ namespace :redmine do
           end
           r.save!
           custom_field_map['RT ID'] = r
-        end ### end custom field
+          ### end custom field
+        
+          # Tickets - migrate by queue
+          RTQueues.find_each do |queue|
+            next if queue.Name == '___Approvals' # we don't migrate this queue
+            # find out if we want to migrate this queue
+            identifier = prompt('Redmine target project identifier for %s queue' % queue.Name, :default => queue.Name.downcase.dasherize.gsub(/[ ]/,'-')) {|identifier| RTMigrate.target_project_identifier identifier}    
+            next if true
+            print "Migrating tickets"
+            RTTickets.find_each(:batch_size => 200, :conditions => "1=2") do |ticket|
+              print '.'
+              STDOUT.flush
+              i = Issue.new :project => @target_project,
+                              :subject => encode(ticket.summary[0, limit_for(Issue, 'subject')]),
+                              :description => convert_wiki_text(encode(ticket.description)),
+                              :priority => PRIORITY_MAPPING[ticket.priority] || DEFAULT_PRIORITY,
+                              :created_on => ticket.time
+              i.author = find_or_create_user(ticket.reporter)
+              i.category = issues_category_map[ticket.component] unless ticket.component.blank?
+              i.fixed_version = version_map[ticket.milestone] unless ticket.milestone.blank?
+              i.status = STATUS_MAPPING[ticket.status] || DEFAULT_STATUS
+              i.tracker = TRACKER_MAPPING[ticket.ticket_type] || DEFAULT_TRACKER
+              i.id = ticket.id unless Issue.exists?(ticket.id)
+              next unless Time.fake(ticket.changetime) { i.save }
+              TICKET_MAP[ticket.id] = i.id
+              migrated_tickets += 1
+
+              # Owner
+                unless ticket.owner.blank?
+                  i.assigned_to = find_or_create_user(ticket.owner, true)
+                  Time.fake(ticket.changetime) { i.save }
+                end
+
+              # Comments and status/resolution changes
+              ticket.changes.group_by(&:time).each do |time, changeset|
+                  status_change = changeset.select {|change| change.field == 'status'}.first
+                  resolution_change = changeset.select {|change| change.field == 'resolution'}.first
+                  comment_change = changeset.select {|change| change.field == 'comment'}.first
+
+                  n = Journal.new :notes => (comment_change ? convert_wiki_text(encode(comment_change.newvalue)) : ''),
+                                  :created_on => time
+                  n.user = find_or_create_user(changeset.first.author)
+                  n.journalized = i
+                  if status_change &&
+                       STATUS_MAPPING[status_change.oldvalue] &&
+                       STATUS_MAPPING[status_change.newvalue] &&
+                       (STATUS_MAPPING[status_change.oldvalue] != STATUS_MAPPING[status_change.newvalue])
+                    n.details << JournalDetail.new(:property => 'attr',
+                                                   :prop_key => 'status_id',
+                                                   :old_value => STATUS_MAPPING[status_change.oldvalue].id,
+                                                   :value => STATUS_MAPPING[status_change.newvalue].id)
+                  end
+                  if resolution_change
+                    n.details << JournalDetail.new(:property => 'cf',
+                                                   :prop_key => custom_field_map['resolution'].id,
+                                                   :old_value => resolution_change.oldvalue,
+                                                   :value => resolution_change.newvalue)
+                  end
+                  n.save unless n.details.empty? && n.notes.blank?
+              end
+
+              # Attachments
+              ticket.attachments.each do |attachment|
+                next unless attachment.exist?
+                  attachment.open {
+                    a = Attachment.new :created_on => attachment.time
+                    a.file = attachment
+                    a.author = find_or_create_user(attachment.author)
+                    a.container = i
+                    a.description = attachment.description
+                    migrated_ticket_attachments += 1 if a.save
+                  }
+              end
+
+              # Custom fields
+              custom_values = ticket.customs.inject({}) do |h, custom|
+                if custom_field = custom_field_map[custom.name]
+                  h[custom_field.id] = custom.value
+                  migrated_custom_values += 1
+                end
+                h
+              end
+              if custom_field_map['resolution'] && !ticket.resolution.blank?
+                custom_values[custom_field_map['resolution'].id] = ticket.resolution
+              end
+              i.custom_field_values = custom_values
+              i.save_custom_field_values
+            end # end ticket migration
+            
+            # update issue id sequence if needed (postgresql)
+            Issue.connection.reset_pk_sequence!(Issue.table_name) if Issue.connection.respond_to?('reset_pk_sequence!')
+            puts
+          end # end queue migrate
+        
+        end # end transaction
         puts 'complete'
         
       end ### end self.migrate
@@ -338,7 +433,6 @@ namespace :redmine do
         u
       end # end find_or_create_user
       
-      
       # mapping active record classes to RT3
       class RTUsers < ActiveRecord::Base
         set_table_name :users
@@ -356,24 +450,29 @@ namespace :redmine do
         set_table_name :customfieldvalues
         
         belongs_to :rtcustomfields # foreign key - CustomField
-        
       end
       
-      
-      # create a mapping from standard RT3 elements to redmine
-    
       # RT Queue ~= Redmine Project, possible multiple queues => one project with custom field
-      ## Name = Name
-      ## Description = Description
-      ## InitialPriority
-      ## FinalPriority
-    
-    
-      # RT Ticket = Redmine Issues
-    
-    
-      # RT Groups = Redmine Groups
+      class RTQueues < ActiveRecord::Base
+        set_table_name :queues
+        
+        has_many :tickets, :class_name => "RTTickets", :foreign_key => :Queue
+      end
       
+      # RT Ticket = Redmine issue
+      # RT does not have a concept of tracker, so all tickets are of one type
+      class RTTickets < ActiveRecord::Base
+        set_table_name :tickets
+        
+        belongs_to :rtqueues
+      end
+      
+      # used in RT simliar to Redmine related/duplicates
+      class RTLinks <ActiveRecord::Base
+        set_table_name :links
+        
+      end
+    
       # encode to proper standard
       private
         def self.encode(text)
