@@ -4,6 +4,10 @@ This project was meant for transitioning from an RT based tracking system to Red
 
 This script was tested with RT 3.8.4 and Redmine 1.0.4
 
+== WARNING
+
+This script was created as a bare minimum to get a targeted RT installation to a redmine instance. Not all features are supported, or converted properly.
+
 == Usage
 
 Copy migrate_from_rt3.rake into the {redmine}/lib/tasks directory (with the other rake tasks).
@@ -21,8 +25,8 @@ Read: I don't care what you do, I just don't want to be liable for anything.
 See the configuration file for more information, but roughly:
 
 RT3					Redmine
+Custom Fields	=>	Issue Custom Fields
 Tickets			=>	Issues
 Queues			=>	Projects (or attributes of projects)
-Custom Fields	=>	Issue Custom Fields
 Users			=>	Users
 Groups			=>	Groups

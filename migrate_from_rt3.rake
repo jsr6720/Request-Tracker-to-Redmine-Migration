@@ -37,26 +37,18 @@ namespace :redmine do
       resolved_status = IssueStatus.find_by_position(3)
       feedback_status = IssueStatus.find_by_position(4)
       closed_status = IssueStatus.find :first, :conditions => { :is_closed => true }
+      rejected_status = IssueStatus.find :last, :conditions => { :is_closed => true }
       STATUS_MAPPING = {'new' => DEFAULT_STATUS,
-                        'reopened' => feedback_status,
-                        'assigned' => assigned_status,
-                        'closed' => closed_status
+                        'open' => assigned_status,
+                        'stalled' => feedback_status,
+                        'resolved' => closed_status,
+                        'rejected' => rejected_status,
+                        'deleted' => rejected_status # should get skipped over, but here if that code gets removed (ie migrate deleted tickets)
                         }
-
-      priorities = IssuePriority.all
-      DEFAULT_PRIORITY = priorities[0]
-      PRIORITY_MAPPING = {'lowest' => priorities[0],
-                          'low' => priorities[0],
-                          'normal' => priorities[1],
-                          'high' => priorities[2],
-                          'highest' => priorities[3],
-                          # ---
-                          'trivial' => priorities[0],
-                          'minor' => priorities[1],
-                          'major' => priorities[2],
-                          'critical' => priorities[3],
-                          'blocker' => priorities[4]
-                          }
+      
+      
+      PRIORITY_MAPPING = IssuePriority.all
+      DEFAULT_PRIORITY = PRIORITY_MAPPING[0]
 
       TRACKER_BUG = Tracker.find_by_position(1)
       TRACKER_FEATURE = Tracker.find_by_position(2)
@@ -70,9 +62,11 @@ namespace :redmine do
       roles = Role.find(:all, :conditions => {:builtin => 0}, :order => 'position ASC')
       manager_role = roles[0]
       developer_role = roles[1]
+      reporter_role = roles[2]
       DEFAULT_ROLE = roles.last
       ROLE_MAPPING = {'admin' => manager_role,
-                      'developer' => developer_role
+                      'developer' => developer_role,
+                      'reporter' => reporter_role
                       }
       
       # MAP RT Custom fields to Redmine custom fields
@@ -80,6 +74,21 @@ namespace :redmine do
                               }
       CUSTOM_FIELD_MAPPING.default = 'string' # if not found default to string type
       
+      # utillity class
+      class ::Time
+        class << self
+          alias :real_now :now
+          def now
+            real_now - @fake_diff.to_i
+          end
+          def fake(time)
+            @fake_diff = real_now - time
+            res = yield
+            @fake_diff = 0
+           res
+          end
+        end
+      end
       
       # entry point for migrate script.
       def self.migrate
@@ -154,35 +163,51 @@ namespace :redmine do
           ### end custom field
         
           # Tickets - migrate by queue
-          RTQueues.find_each do |queue|
+          RTQueues.find_each do |queue| # find_each
             next if queue.Name == '___Approvals' # we don't migrate this queue
-            # find out if we want to migrate this queue
-            identifier = prompt('Redmine target project identifier for %s queue' % queue.Name, :default => queue.Name.downcase.dasherize.gsub(/[ ]/,'-')) {|identifier| RTMigrate.target_project_identifier identifier}    
-            next if true
+            # get an identifier for the queue
+            prompt('Redmine target project identifier for %s queue' % queue.Name, :default => queue.Name.downcase.dasherize.gsub(/[ ]/,'-')) {|identifier| RTMigrate.target_project_identifier identifier}
+            
             print "Migrating tickets"
-            RTTickets.find_each(:batch_size => 200, :conditions => "1=2") do |ticket|
+            queue.tickets.find_each do |ticket|
+              next if ticket.Status == 'deleted' # we don't migrate deleted tickets
               print '.'
               STDOUT.flush
+              
+              # create the new issue
               i = Issue.new :project => @target_project,
-                              :subject => encode(ticket.summary[0, limit_for(Issue, 'subject')]),
-                              :description => convert_wiki_text(encode(ticket.description)),
-                              :priority => PRIORITY_MAPPING[ticket.priority] || DEFAULT_PRIORITY,
-                              :created_on => ticket.time
-              i.author = find_or_create_user(ticket.reporter)
-              i.category = issues_category_map[ticket.component] unless ticket.component.blank?
-              i.fixed_version = version_map[ticket.milestone] unless ticket.milestone.blank?
-              i.status = STATUS_MAPPING[ticket.status] || DEFAULT_STATUS
-              i.tracker = TRACKER_MAPPING[ticket.ticket_type] || DEFAULT_TRACKER
+                              :subject => encode(ticket.Subject[0, limit_for(Issue, 'subject')]),
+                              :description => 'RT migrate, see first comment',
+                              :priority => normalize_rt_priority(ticket.Priority) || DEFAULT_PRIORITY,
+                              :created_on => ticket.Created
+              
+            #  puts ticket.transactions
+              trans = ticket.transactions.find(:last, :conditions => ["ObjectType = ? and ObjectId = ? and Type = ? and Field = ?", 'RT::Ticket', ticket.id, 'AddWatcher', 'Requestor'])
+              trans ||= ticket.transactions.find(:last, :conditions => ["ObjectType = ? and ObjectId = ? and Type = ?", 'RT::Ticket', ticket.id, 'Create'])
+              i.author = find_or_create_user('') # requester
+              i.status = STATUS_MAPPING[ticket.Status] || DEFAULT_STATUS
+              
+              # RT has no concept of a tracker. so default it
+              i.tracker = TRACKER_MAPPING[ticket.type] || DEFAULT_TRACKER
+              
+              # if importing into a blank system this works
               i.id = ticket.id unless Issue.exists?(ticket.id)
-              next unless Time.fake(ticket.changetime) { i.save }
+              
+              # @TODO set the custom field RT ID
+              
+              # we'll want to set this for some projects. ie Sub-Queue becomes Queue with 'Sub' category
+              # i.category = issues_category_map[ticket.component] unless ticket.component.blank?
+              
+              next unless Time.fake(ticket.LastUpdated) { i.save }
               TICKET_MAP[ticket.id] = i.id
               migrated_tickets += 1
-
+              
               # Owner
-                unless ticket.owner.blank?
-                  i.assigned_to = find_or_create_user(ticket.owner, true)
-                  Time.fake(ticket.changetime) { i.save }
-                end
+              unless ticket.Owner.blank?
+                i.assigned_to = find_or_create_user('', true) # RTUsers.find_by_id(ticket.Owner).Name
+                Time.fake(ticket.LastUpdated) { i.save }
+              end
+=begin
 
               # Comments and status/resolution changes
               ticket.changes.group_by(&:time).each do |time, changeset|
@@ -238,6 +263,7 @@ namespace :redmine do
               end
               i.custom_field_values = custom_values
               i.save_custom_field_values
+=end
             end # end ticket migration
             
             # update issue id sequence if needed (postgresql)
@@ -271,12 +297,12 @@ namespace :redmine do
           puts "Unable to create a project with identifier '#{identifier}'!" unless project.save
           # enable issues and wiki for the created project
           project.enabled_module_names = ['issue_tracking', 'wiki']
-#        else
-#          puts
-#          puts "This project already exists in your Redmine database."
-#          print "Are you sure you want to append data to this project ? [Y/n] "
-#          STDOUT.flush
-#          exit if STDIN.gets.match(/^n$/i)
+        else
+          puts
+          puts "This project already exists in your Redmine database."
+          print "Are you sure you want to append data to this project ? [Y/n] "
+          STDOUT.flush
+          exit if STDIN.gets.match(/^n$/i)
         end
         project.trackers << TRACKER_BUG unless project.trackers.include?(TRACKER_BUG)
         project.trackers << TRACKER_FEATURE unless project.trackers.include?(TRACKER_FEATURE)
@@ -309,14 +335,30 @@ namespace :redmine do
         klass.columns_hash[attribute.to_s].limit
       end
       
-      # Following are get/set for user collected prompts
+      # encode to make sure we have good data
       def self.encoding(charset)
         @ic = Iconv.new('UTF-8', charset)
       rescue Iconv::InvalidEncoding
         puts "Invalid encoding!"
         return false
       end
-
+      
+      # normlize integer based priorities with redmine contex based priorities
+      def self.normalize_rt_priority(priority)
+        # @TODO take the initial priority, final pirority and current priority
+        # => normalize into a 0-5 value
+        
+        # 'low' => priorities[0],
+        # 'normal' => priorities[1],
+        # 'high' => priorities[2],
+        # 'urgent' => priorities[3],
+        # 'immediate' => priorities[4]
+        
+        # just return a normal for now
+        PRIORITY_MAPPING[1]
+      end
+      
+      # Following are get/set for user collected prompts
       def self.set_rt_directory(path)
         @@rt_directory = path
         raise "This directory doesn't exist!" unless File.directory?(path)
@@ -391,18 +433,19 @@ namespace :redmine do
       # when migrating tickets and other RT data lets create members if needed
       def self.find_or_create_user(username, project_member = false)
         return User.anonymous if username.blank?
-
+        
+        # search redmine for this user
         u = User.find_by_login(username)
         if !u
           # Create a new user if not found
           mail = username[0,limit_for(User, 'mail')]
-          if mail_attr = RTUsers.find_by_sid_and_name(username, 'email')
+          if mail_attr = RTUsers.find_by_Name(username)
             mail = mail_attr.value
           end
           mail = "#{mail}@foo.bar" unless mail.include?("@")
 
           name = username
-          if name_attr = RTUsers.find_by_sid_and_name(username, 'name')
+          if name_attr = RTUsers.find_by_Name(username)
             name = name_attr.value
           end
           name =~ (/(.*)(\s+\w+)?/)
@@ -415,18 +458,17 @@ namespace :redmine do
 
           u.login = username[0,limit_for(User, 'login')].gsub(/[^a-z0-9_\-@\.]/i, '-')
           u.password = 'rt_user'
-          u.admin = true if TracPermission.find_by_username_and_action(username, 'admin')
+          # RT permissions not boiled down to one action
+          # u.admin = true if TracPermission.find_by_username_and_action(username, 'admin')
+          
           # finally, a default user is used if the new user is not valid
           u = User.find(:first) unless u.save
         end
         # Make sure he is a member of the project
         if project_member && !u.member_of?(@target_project)
-          role = DEFAULT_ROLE
-          if u.admin
-            role = ROLE_MAPPING['admin']
-          elsif TracPermission.find_by_username_and_action(username, 'developer')
-            role = ROLE_MAPPING['developer']
-          end
+          # RT role mapping not great, so just make them a reporter
+          role = ROLE_MAPPING['reporter']
+          
           Member.create(:user => u, :project => @target_project, :roles => [role])
           u.reload
         end
@@ -452,7 +494,7 @@ namespace :redmine do
         belongs_to :rtcustomfields # foreign key - CustomField
       end
       
-      # RT Queue ~= Redmine Project, possible multiple queues => one project with custom field
+      # RT Queue ~= Redmine Project
       class RTQueues < ActiveRecord::Base
         set_table_name :queues
         
@@ -465,12 +507,29 @@ namespace :redmine do
         set_table_name :tickets
         
         belongs_to :rtqueues
+        has_many :transactions, :class_name => "RTTransactions", :foreign_key => :ObjectId
+      end
+      
+      # all actions in RT tracked via transactions
+      # transactions have attachemnts
+      class RTTransactions < ActiveRecord::Base
+        set_table_name :transactions
+        
+        # that is to say there are ticket transactions here was well as many others
+        belongs_to :rttickets, :polymorphic => true
+        has_many :attachments, :class_name => "RTAttachments", :foreign_key => :TransactionId
+      end
+      
+      # RT attachemnts is not just files, but also content
+      class RTAttachments < ActiveRecord::Base
+        set_table_name :attachments
+        
+        belongs_to :rttransactions # foreign key TransactionId
       end
       
       # used in RT simliar to Redmine related/duplicates
-      class RTLinks <ActiveRecord::Base
+      class RTLinks < ActiveRecord::Base
         set_table_name :links
-        
       end
     
       # encode to proper standard
@@ -483,22 +542,22 @@ namespace :redmine do
     end #RTMigrate Module
     
     # lets make sure the user has a created database
-#    puts
-#    if Redmine::DefaultData::Loader.no_data?
-#      puts "Redmine configuration need to be loaded before importing data."
-#      puts "Please, run this first:"
-#      puts
-#      puts "  rake redmine:load_default_data RAILS_ENV=\"#{ENV['RAILS_ENV']}\""
-#      exit
-#    else
-#      puts "Redmine configuration found. Moving on."
-#    end
+    puts
+    if Redmine::DefaultData::Loader.no_data?
+      puts "Redmine configuration need to be loaded before importing data."
+      puts "Please, run this first:"
+      puts
+      puts "  rake redmine:load_default_data RAILS_ENV=\"#{ENV['RAILS_ENV']}\""
+      exit
+    else
+      puts "Redmine configuration found. Moving on."
+    end
     
     # give the user one last chance to quit
-#    print "WARNING: Back up before doing this, are you sure you want to continue ? [y/N] "
-#    STDOUT.flush
-#    break unless STDIN.gets.match(/^y$/i)
-#    puts
+    print "WARNING: Back up before doing this, are you sure you want to continue ? [y/N] "
+    STDOUT.flush
+    break unless STDIN.gets.match(/^y$/i)
+    puts
     
     # make one funciton for outputing a question and getting a response
     def prompt(text, options = {}, &block)
@@ -517,33 +576,20 @@ namespace :redmine do
     # uses def prompt for getting/setting values
     # Don't think I need the directory
     # prompt('RT directory', :default => '/opt/rt3') {|directory| RTMigrate.set_rt_directory directory.strip}
-#    prompt('RT database adapter (sqlite, sqlite3, mysql, postgresql)', :default => 'mysql') {|adapter| RTMigrate.set_rt_adapter adapter}
-#    unless %w(sqlite sqlite3).include?(RTMigrate.rt_adapter)
-#      # we need more info if it's not sqlite3
-#      prompt('RT database host', :default => 'localhost') {|host| RTMigrate.set_rt_db_host host}
-#      prompt('RT database port', :default => DEFAULT_PORTS[RTMigrate.rt_adapter]) {|port| RTMigrate.set_rt_db_port port}
-#      prompt('RT database name', :default => 'rt3') {|name| RTMigrate.set_rt_db_name name}
-#      prompt('RT database schema', :default => 'public') {|schema| RTMigrate.set_rt_db_schema schema}
-#      prompt('RT database username', :default => 'rt') {|username| RTMigrate.set_rt_db_username username}
-#      prompt('RT database password') {|password| RTMigrate.set_rt_db_password password}
-#    end
-#    prompt('RT database encoding', :default => 'UTF-8') {|encoding| RTMigrate.encoding encoding}
-#    prompt('RT queue name', :default => 'general') {|queue| RTMigrate.set_rt_queue queue}
-#    prompt('Redmine target project identifier', :default => RTMigrate.get_rt_queue) {|identifier| RTMigrate.target_project_identifier identifier}
-#    puts
-    
-    # lets hardcode for now
-    puts 'hardcoded assignment'
-    RTMigrate.set_rt_adapter("mysql")
-    RTMigrate.set_rt_db_host("localhost")
-    RTMigrate.set_rt_db_port(3306)
-    RTMigrate.set_rt_db_name('rt3')
-    RTMigrate.set_rt_db_schema('public')
-    RTMigrate.set_rt_db_username('rt')
-    RTMigrate.set_rt_db_password('flower')
-    RTMigrate.encoding('UTF-8')
-    RTMigrate.set_rt_queue('general')
-    RTMigrate.target_project_identifier('general')
+    prompt('RT database adapter (sqlite, sqlite3, mysql, postgresql)', :default => 'mysql') {|adapter| RTMigrate.set_rt_adapter adapter}
+    unless %w(sqlite sqlite3).include?(RTMigrate.rt_adapter)
+      # we need more info if it's not sqlite3
+      prompt('RT database host', :default => 'localhost') {|host| RTMigrate.set_rt_db_host host}
+      prompt('RT database port', :default => DEFAULT_PORTS[RTMigrate.rt_adapter]) {|port| RTMigrate.set_rt_db_port port}
+      prompt('RT database name', :default => 'rt3') {|name| RTMigrate.set_rt_db_name name}
+      prompt('RT database schema', :default => 'public') {|schema| RTMigrate.set_rt_db_schema schema}
+      prompt('RT database username', :default => 'rt') {|username| RTMigrate.set_rt_db_username username}
+      prompt('RT database password') {|password| RTMigrate.set_rt_db_password password}
+    end
+    prompt('RT database encoding', :default => 'UTF-8') {|encoding| RTMigrate.encoding encoding}
+    prompt('RT queue name', :default => 'general') {|queue| RTMigrate.set_rt_queue queue}
+    prompt('Redmine target project identifier', :default => RTMigrate.get_rt_queue) {|identifier| RTMigrate.target_project_identifier identifier}
+    puts
     
     # now lets do the migrate
     Setting.notified_events = [] # Turn off email notifications

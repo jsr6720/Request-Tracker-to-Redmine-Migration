@@ -78,6 +78,8 @@ In RT you could attach reminders to tickets that would show up on your main page
 
 At best comments can be made against an issue, or watch an issue.
 
+*NOTE* reminders live in the tickets table as rt3.tickets.type = 'reminder' so they could be converted as pseudo tickets if needed, related to the attached ticket.
+
 h3. Ticket Status 'delete'
 
 There is no way to *delete* an issue in Redmine short of deleting an entire project. Currently the two equivalent statuses would be *Closed* or *Rejected*.
