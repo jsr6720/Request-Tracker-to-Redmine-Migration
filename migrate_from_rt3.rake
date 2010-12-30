@@ -20,6 +20,16 @@ require 'active_record' # db access
 require 'iconv' # setting char sets
 require 'pp'
 
+# convert html to textile
+if Gem.available?('html2textile')
+  require 'html2textile'
+else
+  print "WARNING: html2textile gem not found, do you want to continue? (RT content transfered as html text) [y/N] "
+  STDOUT.flush
+  break unless STDIN.gets.match(/^y$/i)
+  puts
+end
+
 namespace :redmine do
   desc "Migrate from RT3 to Redmine"
   task :migrate_from_rt3  => :environment do
@@ -74,7 +84,7 @@ namespace :redmine do
                               }
       CUSTOM_FIELD_MAPPING.default = 'string' # if not found default to string type
       
-      # utillity class
+      # utillity class used to take time in the past
       class ::Time
         class << self
           alias :real_now :now
@@ -90,6 +100,28 @@ namespace :redmine do
         end
       end
       
+      # Basic wiki syntax conversion, an RT ticket comment = Redmine issue update
+      def self.convert_wiki_text(text)
+        return '' if text.blank? # nothing to convert
+        
+        text = text.strip
+        # if we have the gem lets translate html to textile
+        if Gem.available?('html2textile') # we've included it above
+          if text.downcase.grep(/<\/?[^>]*>/).count > 1 # only parse html blocks
+            # plain text blocks include a link to an issue with <URL link > so any more than one is considered 'html'
+            # because not all stored blocks of html have <html> tags
+            parser = HTMLToTextileParser.new
+            parser.feed(text)
+            text = parser.to_textile
+          end
+        else
+          # escape html code
+          text = ERB::Util.html_escape(text)
+        end
+        
+        text
+      end # end convert_wiki_text def
+      
       # entry point for migrate script.
       def self.migrate
         establish_connection
@@ -102,6 +134,7 @@ namespace :redmine do
         migrated_tickets = 0
         migrated_ticket_attachments = 0
         
+        Issue.delete_all
         puts 'migrating data'
         # lets do a transaction
         ActiveRecord::Base.transaction do
@@ -165,14 +198,17 @@ namespace :redmine do
           # Tickets - migrate by queue
           RTQueues.find_each do |queue| # find_each
             next if queue.Name == '___Approvals' # we don't migrate this queue
+            next unless queue.Name == 'Flexo'
             # get an identifier for the queue
             prompt('Redmine target project identifier for %s queue' % queue.Name, :default => queue.Name.downcase.dasherize.gsub(/[ ]/,'-')) {|identifier| RTMigrate.target_project_identifier identifier}
             
             print "Migrating tickets"
             queue.tickets.find_each do |ticket|
               next if ticket.Status == 'deleted' # we don't migrate deleted tickets
+              next unless ticket.id == 1312
               print '.'
               STDOUT.flush
+              puts ticket.id
               
               # create the new issue
               i = Issue.new :project => @target_project,
@@ -181,9 +217,6 @@ namespace :redmine do
                               :priority => normalize_rt_priority(ticket.Priority) || DEFAULT_PRIORITY,
                               :created_on => ticket.Created
               
-            #  puts ticket.transactions
-              trans = ticket.transactions.find(:last, :conditions => ["ObjectType = ? and ObjectId = ? and Type = ? and Field = ?", 'RT::Ticket', ticket.id, 'AddWatcher', 'Requestor'])
-              trans ||= ticket.transactions.find(:last, :conditions => ["ObjectType = ? and ObjectId = ? and Type = ?", 'RT::Ticket', ticket.id, 'Create'])
               i.author = find_or_create_user('') # requester
               i.status = STATUS_MAPPING[ticket.Status] || DEFAULT_STATUS
               
@@ -193,9 +226,8 @@ namespace :redmine do
               # if importing into a blank system this works
               i.id = ticket.id unless Issue.exists?(ticket.id)
               
-              # @TODO set the custom field RT ID
+              # set the custom field RT ID
               
-              # we'll want to set this for some projects. ie Sub-Queue becomes Queue with 'Sub' category
               # i.category = issues_category_map[ticket.component] unless ticket.component.blank?
               
               next unless Time.fake(ticket.LastUpdated) { i.save }
@@ -207,48 +239,92 @@ namespace :redmine do
                 i.assigned_to = find_or_create_user('', true) # RTUsers.find_by_id(ticket.Owner).Name
                 Time.fake(ticket.LastUpdated) { i.save }
               end
-=begin
-
+              
               # Comments and status/resolution changes
-              ticket.changes.group_by(&:time).each do |time, changeset|
-                  status_change = changeset.select {|change| change.field == 'status'}.first
-                  resolution_change = changeset.select {|change| change.field == 'resolution'}.first
-                  comment_change = changeset.select {|change| change.field == 'comment'}.first
+              ticket.transactions.each do |changeset|
+                next unless changeset.ObjectType == "RT::Ticket" # we're only interested in ticket transactions
+                next if changeset.Type.include?('EmailRecord') # we're not tracking this (dup info)
+                
+                # create a journal entry
+                if changeset.attachments.empty? 
+                  puts changeset.Type
+                  content = ''
+                else
+                  content = changeset.attachments.first.Content
+                end
+                
+                # each transaction can have 1..N attachments (refer to model)
+                # a transaction = a journal entry
+                n = Journal.new :notes => (changeset ? convert_wiki_text(encode(content)) : ''),
+                                :created_on => changeset.Created
+                n.user = find_or_create_user('') #changeset.author
+                n.journalized = i # this entry for this issue
+                
+                # are any of the attachments files
+                changeset.attachments.each do |attachment|
+                  if attachment.Content && !attachment.Filename then n.notes << convert_wiki_text(encode(attachment.Content)) end
+                  
+                  next unless attachment.Filename # looking for images/files/whatever
+                    
+                    a = nil
+                    attachment.open {
+                      a = Attachment.new :created_on => attachment.time
+                      a.file = attachment
+                      a.author = find_or_create_user('')
+                      a.container = i
+                      a.description = 'RT migrate: ' + attachment.Filename
+                      migrated_ticket_attachments += 1 if a.save
+                    }
+                    
+                    # lets make it show if save worked
+                    if a then n.notes << ' !'+attachment.Filename+'!' end
+                    
+                end
+                
+                
+                # depending on the type of entry we could have additional things to do
+                case changeset.Type.downcase
+                when 'create'
+                  puts 'create'
+                when 'comment', 'correspond'
+                  # create = e-mail sent in, or ticket first created
+                  # comment/correspond = notes added to ticket
+                  puts 'notes made'
+                when 'status' # status change has no attachments
+                  puts 'status change'
+                else
+                  #puts changeset.Type
+                end
+                
+                
+                # save it
+                n.save unless n.details.empty? && n.notes.blank?
+                
+                next
+                  status_change = changeset.select {|change| change.Type.downcase == 'status'}.first
+                  resolution_change = changeset.select {|change| change.Type.downcase == 'resolution'}.first
+                  comment_change = changeset.select {|change| change.Type.downcase == 'comment'}.first
 
-                  n = Journal.new :notes => (comment_change ? convert_wiki_text(encode(comment_change.newvalue)) : ''),
-                                  :created_on => time
-                  n.user = find_or_create_user(changeset.first.author)
-                  n.journalized = i
+                  
                   if status_change &&
-                       STATUS_MAPPING[status_change.oldvalue] &&
-                       STATUS_MAPPING[status_change.newvalue] &&
-                       (STATUS_MAPPING[status_change.oldvalue] != STATUS_MAPPING[status_change.newvalue])
+                       STATUS_MAPPING[status_change.OldValue] &&
+                       STATUS_MAPPING[status_change.NewValue] &&
+                       (STATUS_MAPPING[status_change.OldValue] != STATUS_MAPPING[status_change.NewValue])
                     n.details << JournalDetail.new(:property => 'attr',
                                                    :prop_key => 'status_id',
-                                                   :old_value => STATUS_MAPPING[status_change.oldvalue].id,
-                                                   :value => STATUS_MAPPING[status_change.newvalue].id)
+                                                   :old_value => STATUS_MAPPING[status_change.OldValue].id,
+                                                   :value => STATUS_MAPPING[status_change.NewValue].id)
                   end
+                  
                   if resolution_change
                     n.details << JournalDetail.new(:property => 'cf',
                                                    :prop_key => custom_field_map['resolution'].id,
-                                                   :old_value => resolution_change.oldvalue,
-                                                   :value => resolution_change.newvalue)
+                                                   :old_value => resolution_change.OldValue,
+                                                   :value => resolution_change.NewValue)
                   end
-                  n.save unless n.details.empty? && n.notes.blank?
+                  
               end
-
-              # Attachments
-              ticket.attachments.each do |attachment|
-                next unless attachment.exist?
-                  attachment.open {
-                    a = Attachment.new :created_on => attachment.time
-                    a.file = attachment
-                    a.author = find_or_create_user(attachment.author)
-                    a.container = i
-                    a.description = attachment.description
-                    migrated_ticket_attachments += 1 if a.save
-                  }
-              end
+=begin
 
               # Custom fields
               custom_values = ticket.customs.inject({}) do |h, custom|
@@ -525,6 +601,32 @@ namespace :redmine do
         set_table_name :attachments
         
         belongs_to :rttransactions # foreign key TransactionId
+        
+        def time; Time.at(read_attribute(:Created)) end
+        
+        def size
+          @file.stat.size
+        end
+        
+        def content_type; read_attribute(:ContentType) end
+        
+        def original_filename; read_attribute(:Filename) end
+        
+        def read(*args)
+          @file.read(*args)
+        end
+        
+        def open
+          # @TODO make into temp files
+          # save the file then open it
+          filename = "/tmp/redmine/" + read_attribute(:Filename)
+          File.open(filename, 'w') {|f| f.write(read_attribute(:Content)) }
+          
+          File.open(filename, 'rb') {|f|
+            @file = f
+            yield self
+          }
+        end
       end
       
       # used in RT simliar to Redmine related/duplicates
@@ -540,7 +642,7 @@ namespace :redmine do
           text
         end
     end #RTMigrate Module
-    
+
     # lets make sure the user has a created database
     puts
     if Redmine::DefaultData::Loader.no_data?
@@ -553,11 +655,12 @@ namespace :redmine do
       puts "Redmine configuration found. Moving on."
     end
     
-    # give the user one last chance to quit
+  # give the user one last chance to quit
     print "WARNING: Back up before doing this, are you sure you want to continue ? [y/N] "
     STDOUT.flush
     break unless STDIN.gets.match(/^y$/i)
     puts
+
     
     # make one funciton for outputing a question and getting a response
     def prompt(text, options = {}, &block)
@@ -572,7 +675,7 @@ namespace :redmine do
     end # end def prompt
     
     DEFAULT_PORTS = {'mysql' => 3306, 'postgresql' => 5432}
-    
+
     # uses def prompt for getting/setting values
     # Don't think I need the directory
     # prompt('RT directory', :default => '/opt/rt3') {|directory| RTMigrate.set_rt_directory directory.strip}
@@ -590,6 +693,7 @@ namespace :redmine do
     prompt('RT queue name', :default => 'general') {|queue| RTMigrate.set_rt_queue queue}
     prompt('Redmine target project identifier', :default => RTMigrate.get_rt_queue) {|identifier| RTMigrate.target_project_identifier identifier}
     puts
+
     
     # now lets do the migrate
     Setting.notified_events = [] # Turn off email notifications

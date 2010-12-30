@@ -8,7 +8,11 @@ This script was tested with RT 3.8.4 and Redmine 1.0.4
 
 This script was created as a bare minimum to get a targeted RT installation to a redmine instance. Not all features are supported, or converted properly.
 
+It would seem the entire migration could be done via the transaction table instead of 'mapping' things, but thats a project for another day.
+
 == Usage
+
+OPTIONAL: https://github.com/jystewart/html2textile for converting html text to textile. download and install otherwise RT plaintext is migrated.
 
 Copy migrate_from_rt3.rake into the {redmine}/lib/tasks directory (with the other rake tasks).
 
