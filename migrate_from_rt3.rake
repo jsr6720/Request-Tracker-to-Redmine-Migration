@@ -15,10 +15,18 @@
 # Copyright:: Copyright (c) 2010
 # License::   Distributes under the MIT license
 
+
+# TODO: 
+# => custom fields besides text and list
+# => priority normilization ie 1-10 integers convert to Low, Normal, High, Urgent
+# => more advanced user migrate (admin users)
+# => counts don't make much sense at the end. verify
+
 # includes
 require 'active_record' # db access
 require 'iconv' # setting char sets
 require 'pp'
+require 'tempfile'
 
 # convert html to textile
 if Gem.available?('html2textile')
@@ -59,14 +67,17 @@ namespace :redmine do
       
       PRIORITY_MAPPING = IssuePriority.all
       DEFAULT_PRIORITY = PRIORITY_MAPPING[0]
-
+      
+      # RT3 Doesn't natively have a concept of tracker. Our organziation had a custom
+      # field called "Ticket Type" which maps to Tracker
       TRACKER_BUG = Tracker.find_by_position(1)
       TRACKER_FEATURE = Tracker.find_by_position(2)
-      DEFAULT_TRACKER = TRACKER_BUG
-      TRACKER_MAPPING = {'defect' => TRACKER_BUG,
-                         'enhancement' => TRACKER_FEATURE,
-                         'task' => TRACKER_FEATURE,
-                         'patch' =>TRACKER_FEATURE
+      TRACKER_SUPPORT = Tracker.find_by_position(3)
+      # default going with "Support" because RT is originally a support based system
+      DEFAULT_TRACKER = TRACKER_SUPPORT
+      TRACKER_MAPPING = {'Bug' => TRACKER_BUG,
+                         'Error' => TRACKER_BUG,
+                         'Feature Request' => TRACKER_FEATURE
                          }
 
       roles = Role.find(:all, :conditions => {:builtin => 0}, :order => 'position ASC')
@@ -79,6 +90,7 @@ namespace :redmine do
                       'reporter' => reporter_role
                       }
       
+      # TODO target all RT custom field types
       # MAP RT Custom fields to Redmine custom fields
       CUSTOM_FIELD_MAPPING = { 'Select' => 'list'
                               }
@@ -108,6 +120,9 @@ namespace :redmine do
         # if we have the gem lets translate html to textile
         if Gem.available?('html2textile') # we've included it above
           if text.downcase.grep(/<\/?[^>]*>/).count > 1 # only parse html blocks
+            # remove RT generated <img> tags, they are useless, don't translate, and we add it back later
+            text = text.downcase.gsub(/<\/?img[^>]*>/, '')
+            
             # plain text blocks include a link to an issue with <URL link > so any more than one is considered 'html'
             # because not all stored blocks of html have <html> tags
             parser = HTMLToTextileParser.new
@@ -172,10 +187,9 @@ namespace :redmine do
               end
             end
             
-            next if f.new_record?
             f.trackers = Tracker.find(:all)
-            f.projects << @target_project
             custom_field_map[field.Name] = f
+            f.save
           end
           puts
           
@@ -187,10 +201,7 @@ namespace :redmine do
                                    :searchable => true,
                                    :is_filter => true) if r.nil?
           r.trackers = Tracker.find(:all)
-          # only add it to a project if it was newly created
-          if r.new_record?
-            r.projects << @target_project
-          end
+          
           r.save!
           custom_field_map['RT ID'] = r
           ### end custom field
@@ -198,45 +209,53 @@ namespace :redmine do
           # Tickets - migrate by queue
           RTQueues.find_each do |queue| # find_each
             next if queue.Name == '___Approvals' # we don't migrate this queue
-            next unless queue.Name == 'Flexo'
             # get an identifier for the queue
             prompt('Redmine target project identifier for %s queue' % queue.Name, :default => queue.Name.downcase.dasherize.gsub(/[ ]/,'-')) {|identifier| RTMigrate.target_project_identifier identifier}
+            
+            # turn on custom fields for this project
+            @target_project.issue_custom_fields << custom_field_map.values
             
             print "Migrating tickets"
             queue.tickets.find_each do |ticket|
               next if ticket.Status == 'deleted' # we don't migrate deleted tickets
-              next unless ticket.id == 1312
               print '.'
               STDOUT.flush
               puts ticket.id
               
               # create the new issue
               i = Issue.new :project => @target_project,
-                              :subject => encode(ticket.Subject[0, limit_for(Issue, 'subject')]),
-                              :description => 'RT migrate, see first comment',
+                              :subject => encode((ticket.Subject + ': RT# ' + ticket.id.to_s)[0, limit_for(Issue, 'subject')]),
+                              :description => 'RT migrate, if this is present, no comment was made on RT ticket creation',
                               :priority => normalize_rt_priority(ticket.Priority) || DEFAULT_PRIORITY,
-                              :created_on => ticket.Created
+                              :created_on => ticket.Created,
+                              :start_date => ticket.Started
+                              
               
-              i.author = find_or_create_user('') # requester
+              # TODO THIS ISN'T Right
+              i.author = find_or_create_user(ticket.Owner) # requester
               i.status = STATUS_MAPPING[ticket.Status] || DEFAULT_STATUS
               
-              # RT has no concept of a tracker. so default it
-              i.tracker = TRACKER_MAPPING[ticket.type] || DEFAULT_TRACKER
+              # only copy over due dates that make sense
+              if ticket.Due > ticket.Started
+                i.due_date = ticket.Due
+              end
               
-              # if importing into a blank system this works
+              # RT has no concept of a tracker. so default it
+              i.tracker = DEFAULT_TRACKER
+              
+              # time lives at ticket and transactions for RT
+              i.estimated_hours = ticket.TimeEstimated / 60
+              
+              # if importing into a blank system this works 1 to 1, otherwise an RT ID field is created to track old numbers
               i.id = ticket.id unless Issue.exists?(ticket.id)
               
-              # set the custom field RT ID
-              
-              # i.category = issues_category_map[ticket.component] unless ticket.component.blank?
-              
-              next unless Time.fake(ticket.LastUpdated) { i.save }
+              next unless Time.fake(ticket.LastUpdated) { i.save! }
               TICKET_MAP[ticket.id] = i.id
               migrated_tickets += 1
               
               # Owner
               unless ticket.Owner.blank?
-                i.assigned_to = find_or_create_user('', true) # RTUsers.find_by_id(ticket.Owner).Name
+                i.assigned_to = find_or_create_user(ticket.Owner, true) # RTUsers.find_by_id(ticket.Owner).Name
                 Time.fake(ticket.LastUpdated) { i.save }
               end
               
@@ -245,110 +264,134 @@ namespace :redmine do
                 next unless changeset.ObjectType == "RT::Ticket" # we're only interested in ticket transactions
                 next if changeset.Type.include?('EmailRecord') # we're not tracking this (dup info)
                 
-                # create a journal entry
-                if changeset.attachments.empty? 
-                  puts changeset.Type
-                  content = ''
-                else
-                  content = changeset.attachments.first.Content
-                end
-                
                 # each transaction can have 1..N attachments (refer to model)
                 # a transaction = a journal entry
-                n = Journal.new :notes => (changeset ? convert_wiki_text(encode(content)) : ''),
-                                :created_on => changeset.Created
-                n.user = find_or_create_user('') #changeset.author
+                n = Journal.new :created_on => changeset.Created
+                n.user = find_or_create_user(changeset.Creator)
                 n.journalized = i # this entry for this issue
                 
                 # are any of the attachments files
                 changeset.attachments.each do |attachment|
-                  if attachment.Content && !attachment.Filename then n.notes << convert_wiki_text(encode(attachment.Content)) end
+                  next unless !attachment.Content.blank? # looking for content
                   
-                  next unless attachment.Filename # looking for images/files/whatever
+                  if attachment.Filename 
+                    # looking for images/files/whatever
                     
                     a = nil
                     attachment.open {
                       a = Attachment.new :created_on => attachment.time
                       a.file = attachment
-                      a.author = find_or_create_user('')
+                      a.author = find_or_create_user(attachment.Creator)
                       a.container = i
                       a.description = 'RT migrate: ' + attachment.Filename
                       migrated_ticket_attachments += 1 if a.save
                     }
                     
-                    # lets make it show if save worked
-                    if a then n.notes << ' !'+attachment.Filename+'!' end
+                    # lets make it show if save worked and it's an image
+                    if a && attachment.ContentType.include?('image') then n.notes || i.description << ' !'+attachment.Filename+'!' end
+                  else
+                    if changeset.Type == 'Create'
+                      # note goes with description
+                      i.description = convert_wiki_text(encode(attachment.Content))
+                    else
+                      # content is a note
+                      n.notes = convert_wiki_text(encode(attachment.Content))
+                    end
+                  end
                     
                 end
                 
-                
-                # depending on the type of entry we could have additional things to do
-                case changeset.Type.downcase
-                when 'create'
-                  puts 'create'
-                when 'comment', 'correspond'
-                  # create = e-mail sent in, or ticket first created
-                  # comment/correspond = notes added to ticket
-                  puts 'notes made'
-                when 'status' # status change has no attachments
-                  puts 'status change'
-                else
-                  #puts changeset.Type
+                ## give the ticket to someone else, steal the ticket
+                if (changeset.Type == 'Give' || changeset.Type == 'Steal') && changeset.Field == 'Owner'
+                  n.details << JournalDetail.new(:property => 'attr',
+                                                 :prop_key => 'assigned_to_id',
+                                                 :old_value => find_or_create_user(changeset.OldValue).id,
+                                                 :value => find_or_create_user(changeset.NewValue).id)
                 end
                 
+                ## Could be a status change
+                if changeset.Type.downcase == 'status' &&
+                     STATUS_MAPPING[changeset.OldValue] &&
+                     STATUS_MAPPING[changeset.NewValue] &&
+                     (STATUS_MAPPING[changeset.OldValue] != STATUS_MAPPING[changeset.NewValue])
+                  n.details << JournalDetail.new(:property => 'attr',
+                                                 :prop_key => 'status_id',
+                                                 :old_value => STATUS_MAPPING[changeset.OldValue].id,
+                                                 :value => STATUS_MAPPING[changeset.NewValue].id)
+                end # end status change
+                
+                ## set estimated time on ticket
+                if changeset.Type == 'Set' && changeset.Field == 'TimeEstimated'
+                  i.estimated_hours = changeset.NewValue.to_f / 60
+                  
+                  n.details << JournalDetail.new(:property => 'attr',
+                                                 :prop_key => 'estimated_hours',
+                                                 :old_value => changeset.OldValue,
+                                                 :value => changeset.NewValue)
+                end
+                
+                # time logged at a ticket level and with comments
+                if changeset.TimeTaken > 0 || (changeset.Type == 'Set' && changeset.Field == 'TimeWorked')
+                  # TODO: assumes changest.OldValue = 0
+                  (TimeEntry.new :project => @target_project,
+                                      :user => find_or_create_user(changeset.Creator),
+                                      :issue => i,
+                                      :hours => changeset.TimeTaken.to_f / 60 || changeset.NewValue.to_f / 60,
+                                      :comments => 'RT logged time',
+                                      :spent_on => changeset.Created,
+                                      :activity => TimeEntryActivity.last).save
+                  
+                end
                 
                 # save it
                 n.save unless n.details.empty? && n.notes.blank?
-                
-                next
-                  status_change = changeset.select {|change| change.Type.downcase == 'status'}.first
-                  resolution_change = changeset.select {|change| change.Type.downcase == 'resolution'}.first
-                  comment_change = changeset.select {|change| change.Type.downcase == 'comment'}.first
-
                   
-                  if status_change &&
-                       STATUS_MAPPING[status_change.OldValue] &&
-                       STATUS_MAPPING[status_change.NewValue] &&
-                       (STATUS_MAPPING[status_change.OldValue] != STATUS_MAPPING[status_change.NewValue])
-                    n.details << JournalDetail.new(:property => 'attr',
-                                                   :prop_key => 'status_id',
-                                                   :old_value => STATUS_MAPPING[status_change.OldValue].id,
-                                                   :value => STATUS_MAPPING[status_change.NewValue].id)
+              end # end transaction (changeset) loop
+              
+              # set custom fields for the ticket * objectcustomfieldvalues
+              custom_values = ticket.objectcustomfieldvalues.inject({}) do |h, custom|
+                cf = RTCustomFields.find_by_id(custom.CustomField)
+                if custom_field = custom_field_map[cf.Name]
+                  
+                  # let's not blindly copy over everything
+                  case cf.Name
+                  when 'Ticket Type'
+                    # set the issue to the proper lookup or stick with the default
+                    i.tracker = TRACKER_MAPPING[custom.Content] || DEFAULT_TRACKER
+                  else
+                    h[custom_field.id] = custom.Content
                   end
-                  
-                  if resolution_change
-                    n.details << JournalDetail.new(:property => 'cf',
-                                                   :prop_key => custom_field_map['resolution'].id,
-                                                   :old_value => resolution_change.OldValue,
-                                                   :value => resolution_change.NewValue)
-                  end
-                  
-              end
-=begin
-
-              # Custom fields
-              custom_values = ticket.customs.inject({}) do |h, custom|
-                if custom_field = custom_field_map[custom.name]
-                  h[custom_field.id] = custom.value
+                  # count the values
                   migrated_custom_values += 1
                 end
                 h
               end
-              if custom_field_map['resolution'] && !ticket.resolution.blank?
-                custom_values[custom_field_map['resolution'].id] = ticket.resolution
-              end
+              
+              # lets add RT ID
+              custom_values[custom_field_map['RT ID'].id] = ticket.id
+              
               i.custom_field_values = custom_values
               i.save_custom_field_values
-=end
+              Time.fake(ticket.LastUpdated) { i.save }
             end # end ticket migration
             
             # update issue id sequence if needed (postgresql)
             Issue.connection.reset_pk_sequence!(Issue.table_name) if Issue.connection.respond_to?('reset_pk_sequence!')
             puts
           end # end queue migrate
+          
+          # now that all the tickets are over, lets link them up
+          RTLinks.find_each do |link|
+            # we can only link tickets that got migrated
+            #puts link.inspect
+          end
         
         end # end transaction
-        puts 'complete'
+        
+        puts
+        puts "Tickets:         #{migrated_tickets}/#{RTTickets.count}"
+        puts "Ticket files:    #{migrated_ticket_attachments}/" + RTAttachments.count(:conditions => 'Filename is Not Null').to_s
+        puts "Custom values:   #{migrated_custom_values}/#{RTObjectCustomFieldValues.count}"
         
       end ### end self.migrate
       
@@ -372,7 +415,7 @@ namespace :redmine do
           project.identifier = identifier
           puts "Unable to create a project with identifier '#{identifier}'!" unless project.save
           # enable issues and wiki for the created project
-          project.enabled_module_names = ['issue_tracking', 'wiki']
+          project.enabled_module_names = ['issue_tracking', 'wiki', 'time_tracking']
         else
           puts
           puts "This project already exists in your Redmine database."
@@ -382,6 +425,7 @@ namespace :redmine do
         end
         project.trackers << TRACKER_BUG unless project.trackers.include?(TRACKER_BUG)
         project.trackers << TRACKER_FEATURE unless project.trackers.include?(TRACKER_FEATURE)
+        project.trackers << TRACKER_SUPPORT unless project.trackers.include?(TRACKER_SUPPORT)
         @target_project = project.new_record? ? nil : project
         @target_project.reload
       end
@@ -507,23 +551,25 @@ namespace :redmine do
       def self.rt_attachments_directory; "#{rt_directory}/attachments" end
       
       # when migrating tickets and other RT data lets create members if needed
-      def self.find_or_create_user(username, project_member = false)
-        return User.anonymous if username.blank?
+      def self.find_or_create_user(rtuserid, project_member = false)
+        rtuser = RTUsers.find_by_id(rtuserid)
+        # return anonymous if not found
+        return User.anonymous if !rtuser
         
         # search redmine for this user
-        u = User.find_by_login(username)
+        u = User.find_by_mail(rtuser.EmailAddress)
         if !u
           # Create a new user if not found
-          mail = username[0,limit_for(User, 'mail')]
-          if mail_attr = RTUsers.find_by_Name(username)
-            mail = mail_attr.value
-          end
+          mail = rtuser.EmailAddress[0,limit_for(User, 'mail')]
+        #  if mail_attr = RTUsers.find_by_Name(username)
+        #    mail = mail_attr.value
+        #  end
           mail = "#{mail}@foo.bar" unless mail.include?("@")
 
-          name = username
-          if name_attr = RTUsers.find_by_Name(username)
-            name = name_attr.value
-          end
+          name = rtuser.Name
+        #  if name_attr = RTUsers.find_by_Name(username)
+        #    name = name_attr.value
+        #  end
           name =~ (/(.*)(\s+\w+)?/)
           fn = $1.strip
           ln = ($2 || '-').strip
@@ -532,7 +578,7 @@ namespace :redmine do
                        :firstname => fn[0, limit_for(User, 'firstname')].gsub(/[^\w\s\'\-]/i, '-'),
                        :lastname => ln[0, limit_for(User, 'lastname')].gsub(/[^\w\s\'\-]/i, '-')
 
-          u.login = username[0,limit_for(User, 'login')].gsub(/[^a-z0-9_\-@\.]/i, '-')
+          u.login = rtuser.Name[0,limit_for(User, 'login')].gsub(/[^a-z0-9_\-@\.]/i, '-')
           u.password = 'rt_user'
           # RT permissions not boiled down to one action
           # u.admin = true if TracPermission.find_by_username_and_action(username, 'admin')
@@ -540,7 +586,7 @@ namespace :redmine do
           # finally, a default user is used if the new user is not valid
           u = User.find(:first) unless u.save
         end
-        # Make sure he is a member of the project
+        # Make sure user is a member of the project
         if project_member && !u.member_of?(@target_project)
           # RT role mapping not great, so just make them a reporter
           role = ROLE_MAPPING['reporter']
@@ -561,6 +607,7 @@ namespace :redmine do
         set_table_name :customfields
         
         has_many :customfieldvalues, :class_name => "RTCustomFieldValues", :foreign_key => :CustomField
+        has_many :objectcustomfieldvalues, :class_name => "RTObjectCustomFieldValues", :foreign_key => :CustomField
       end
       
       # each custom field has a list of values
@@ -584,6 +631,22 @@ namespace :redmine do
         
         belongs_to :rtqueues
         has_many :transactions, :class_name => "RTTransactions", :foreign_key => :ObjectId
+        has_many :objectcustomfieldvalues, :class_name => "RTObjectCustomFieldValues", :foreign_key => :ObjectId
+      end
+      
+      # RTLinks = Redmine subtasks/related issues
+      class RTLinks < ActiveRecord::Base
+        set_table_name :links
+        
+        belongs_to :rttickets
+      end
+      
+      # custom field vlaues for tickets (and other RT objects)
+      class RTObjectCustomFieldValues < ActiveRecord::Base
+        set_table_name :objectcustomfieldvalues
+        
+        belongs_to :rttickets, :polymorphic => true
+        belongs_to :customfields, :polymorphic => true
       end
       
       # all actions in RT tracked via transactions
@@ -617,12 +680,14 @@ namespace :redmine do
         end
         
         def open
-          # @TODO make into temp files
-          # save the file then open it
-          filename = "/tmp/redmine/" + read_attribute(:Filename)
-          File.open(filename, 'w') {|f| f.write(read_attribute(:Content)) }
-          
-          File.open(filename, 'rb') {|f|
+          # RT stores files as LBLOB, so we write that out to a tempfile
+          # that can then be attached to something
+          filename = read_attribute(:Filename)
+          tf = Tempfile.open(filename) {|f| 
+            f.write(read_attribute(:Content))
+            f.flush
+            f.rewind
+            
             @file = f
             yield self
           }
@@ -660,7 +725,6 @@ namespace :redmine do
     STDOUT.flush
     break unless STDIN.gets.match(/^y$/i)
     puts
-
     
     # make one funciton for outputing a question and getting a response
     def prompt(text, options = {}, &block)
@@ -675,7 +739,7 @@ namespace :redmine do
     end # end def prompt
     
     DEFAULT_PORTS = {'mysql' => 3306, 'postgresql' => 5432}
-
+   
     # uses def prompt for getting/setting values
     # Don't think I need the directory
     # prompt('RT directory', :default => '/opt/rt3') {|directory| RTMigrate.set_rt_directory directory.strip}
@@ -693,7 +757,6 @@ namespace :redmine do
     prompt('RT queue name', :default => 'general') {|queue| RTMigrate.set_rt_queue queue}
     prompt('Redmine target project identifier', :default => RTMigrate.get_rt_queue) {|identifier| RTMigrate.target_project_identifier identifier}
     puts
-
     
     # now lets do the migrate
     Setting.notified_events = [] # Turn off email notifications
