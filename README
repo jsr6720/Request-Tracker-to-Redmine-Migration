@@ -8,7 +8,7 @@ This script was tested with RT 3.8.4 and Redmine 1.0.4
 
 This script was created as a bare minimum to get a targeted RT installation to a redmine instance. Not all features are supported, or converted properly.
 
-It would seem the entire migration could be done via the transaction table instead of 'mapping' things, but thats a project for another day.
+It would seem the entire migration could be done via the transaction table instead of 'mapping' things, but that's a project for another day.
 
 == Usage
 
@@ -26,7 +26,7 @@ Read: I don't care what you do, I just don't want to be liable for anything.
 
 == Targets for migrating
 
-See the configuration file for more information, but roughly:
+Roughly:
 
 RT3					Redmine
 Custom Fields	=>	Issue Custom Fields

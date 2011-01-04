@@ -17,10 +17,16 @@
 
 
 # TODO: 
-# => custom fields besides text and list
+# => RT custom fields besides text and list
 # => priority normilization ie 1-10 integers convert to Low, Normal, High, Urgent
-# => more advanced user migrate (admin users)
+# => more advanced user migrate
+#     * Admin Users
+#     * Groups
+#     * better Name => fname lname mapping, or prompt
+#     * Transfer issues with 'watched' turned on if user is watching it
+#     * Role mapping from RT to Redmine
 # => counts don't make much sense at the end. verify
+# => time tracking is not ideal. if time worked set from 0 to 30, then 30 to 50, 80 min are migrated
 
 # includes
 require 'active_record' # db access
@@ -46,9 +52,15 @@ namespace :redmine do
     module RTMigrate
       
       # set up the mappings from RT -> redmine
-      # RT does not have by default a tracker. all tickets in are
+      # RT does not have by default a tracker. all tickets are
       # "categorized" by queue, status, and priority
       TICKET_MAP = []
+      
+      RELATION_TYPE_MAPPING = {
+                'MergedInto' => IssueRelation::TYPE_DUPLICATES, # duplicate of
+                'RefersTo' => IssueRelation::TYPE_RELATES,    # related to
+                'DependsOn' => IssueRelation::TYPE_BLOCKS,    # blocker
+              }
 
       DEFAULT_STATUS = IssueStatus.default
       assigned_status = IssueStatus.find_by_position(2)
@@ -147,6 +159,7 @@ namespace :redmine do
         # what are we migrating
         migrated_custom_values = 0
         migrated_tickets = 0
+        attempted_migrated_ticket_attachments = 0
         migrated_ticket_attachments = 0
         
         Issue.delete_all
@@ -189,7 +202,7 @@ namespace :redmine do
             
             f.trackers = Tracker.find(:all)
             custom_field_map[field.Name] = f
-            f.save
+            f.save!
           end
           puts
           
@@ -209,6 +222,7 @@ namespace :redmine do
           # Tickets - migrate by queue
           RTQueues.find_each do |queue| # find_each
             next if queue.Name == '___Approvals' # we don't migrate this queue
+            next unless queue.Name == 'Flexo'
             # get an identifier for the queue
             prompt('Redmine target project identifier for %s queue' % queue.Name, :default => queue.Name.downcase.dasherize.gsub(/[ ]/,'-')) {|identifier| RTMigrate.target_project_identifier identifier}
             
@@ -224,15 +238,21 @@ namespace :redmine do
               
               # create the new issue
               i = Issue.new :project => @target_project,
-                              :subject => encode((ticket.Subject + ': RT# ' + ticket.id.to_s)[0, limit_for(Issue, 'subject')]),
-                              :description => 'RT migrate, if this is present, no comment was made on RT ticket creation',
+                              :subject => encode((ticket.Subject + ': RT ' + ticket.id.to_s)[0, limit_for(Issue, 'subject')]),
+                              :description => 'RT migrate. If this text is present, no comment was made on RT ticket creation',
                               :priority => normalize_rt_priority(ticket.Priority) || DEFAULT_PRIORITY,
                               :created_on => ticket.Created,
                               :start_date => ticket.Started
                               
               
-              # TODO THIS ISN'T Right
-              i.author = find_or_create_user(ticket.Owner) # requester
+              # each RT ticket has a 'Create' transaction, which has creator or it has an AddWatcher of Requestor type
+              # Redmine only lets us have one author, so other watchers will be added later
+              # TODO this assumes that the last AddWatcher isn't matched with a DelWatcher that would have no one requesting the ticket
+              r = ticket.transactions.find(:last, :conditions => {:ObjectType => 'RT::Ticket', :Type => 'AddWatcher', :Field => 'Requestor'})
+              # if add watcher is still not there, go with created user
+              r ||= ticket.transactions.find(:first, :conditions => {:ObjectType => 'RT::Ticket', :Type => 'Create'})
+              
+              i.author = find_or_create_user(r.NewValue || r.Creator) # requester
               i.status = STATUS_MAPPING[ticket.Status] || DEFAULT_STATUS
               
               # only copy over due dates that make sense
@@ -250,13 +270,13 @@ namespace :redmine do
               i.id = ticket.id unless Issue.exists?(ticket.id)
               
               next unless Time.fake(ticket.LastUpdated) { i.save! }
-              TICKET_MAP[ticket.id] = i.id
+              TICKET_MAP[ticket.id] = i
               migrated_tickets += 1
               
               # Owner
               unless ticket.Owner.blank?
-                i.assigned_to = find_or_create_user(ticket.Owner, true) # RTUsers.find_by_id(ticket.Owner).Name
-                Time.fake(ticket.LastUpdated) { i.save }
+                i.assigned_to = find_or_create_user(ticket.Owner, true)
+                Time.fake(ticket.LastUpdated) { i.save! }
               end
               
               # Comments and status/resolution changes
@@ -272,7 +292,7 @@ namespace :redmine do
                 
                 # are any of the attachments files
                 changeset.attachments.each do |attachment|
-                  next unless !attachment.Content.blank? # looking for content
+                  next if attachment.Content.blank? # looking for content
                   
                   if attachment.Filename 
                     # looking for images/files/whatever
@@ -284,7 +304,7 @@ namespace :redmine do
                       a.author = find_or_create_user(attachment.Creator)
                       a.container = i
                       a.description = 'RT migrate: ' + attachment.Filename
-                      migrated_ticket_attachments += 1 if a.save
+                      migrated_ticket_attachments += 1 if a.save!
                     }
                     
                     # lets make it show if save worked and it's an image
@@ -305,12 +325,12 @@ namespace :redmine do
                 if (changeset.Type == 'Give' || changeset.Type == 'Steal') && changeset.Field == 'Owner'
                   n.details << JournalDetail.new(:property => 'attr',
                                                  :prop_key => 'assigned_to_id',
-                                                 :old_value => find_or_create_user(changeset.OldValue).id,
-                                                 :value => find_or_create_user(changeset.NewValue).id)
+                                                 :old_value => find_or_create_user(changeset.OldValue) {|u| u ? u.id : nil },
+                                                 :value => find_or_create_user(changeset.NewValue) {|u| u ? u.id : nil })
                 end
                 
                 ## Could be a status change
-                if changeset.Type.downcase == 'status' &&
+                if changeset.Type == 'Status' &&
                      STATUS_MAPPING[changeset.OldValue] &&
                      STATUS_MAPPING[changeset.NewValue] &&
                      (STATUS_MAPPING[changeset.OldValue] != STATUS_MAPPING[changeset.NewValue])
@@ -326,6 +346,16 @@ namespace :redmine do
                   
                   n.details << JournalDetail.new(:property => 'attr',
                                                  :prop_key => 'estimated_hours',
+                                                 :old_value => changeset.OldValue.to_f / 60,
+                                                 :value => changeset.NewValue.to_f / 60)
+                end
+                
+                ## change the subject header
+                if changeset.Type == 'Set' && changeset.Field == 'Subject'
+                  i.estimated_hours = changeset.NewValue.to_f / 60
+                  
+                  n.details << JournalDetail.new(:property => 'attr',
+                                                 :prop_key => 'subject',
                                                  :old_value => changeset.OldValue,
                                                  :value => changeset.NewValue)
                 end
@@ -336,15 +366,28 @@ namespace :redmine do
                   (TimeEntry.new :project => @target_project,
                                       :user => find_or_create_user(changeset.Creator),
                                       :issue => i,
-                                      :hours => changeset.TimeTaken.to_f / 60 || changeset.NewValue.to_f / 60,
+                                      :hours => (changeset.TimeTaken.to_f + changeset.NewValue.to_f) / 60, # only one of these values set, both default to 0
                                       :comments => 'RT logged time',
                                       :spent_on => changeset.Created,
-                                      :activity => TimeEntryActivity.last).save
+                                      :activity => TimeEntryActivity.last).save!
                   
                 end
                 
+                # add watchers since we don't have multiple author's to one issue
+                # this is NOT the same as 'star' watching a ticket in RT, but thats how it maps to redmine
+                # RT has it's own 'star' watch an issue that is not migrated
+                if changeset.Type == 'AddWatcher'
+                  (Watcher.new :watchable_type => 'Issue',
+                                  :watchable_id => i.id,
+                                  :user_id => find_or_create_user(changeset.NewValue).id).save
+                end
+                
+                if changeset.Type == 'DelWatcher' 
+                  Watcher.destroy_all({:watchable_type => 'Issue', :user_id => find_or_create_user(changeset.NewValue).id, :watchable_id => i.id})
+                end
+                
                 # save it
-                n.save unless n.details.empty? && n.notes.blank?
+                n.save! unless n.details.empty? && n.notes.blank?
                   
               end # end transaction (changeset) loop
               
@@ -352,15 +395,7 @@ namespace :redmine do
               custom_values = ticket.objectcustomfieldvalues.inject({}) do |h, custom|
                 cf = RTCustomFields.find_by_id(custom.CustomField)
                 if custom_field = custom_field_map[cf.Name]
-                  
-                  # let's not blindly copy over everything
-                  case cf.Name
-                  when 'Ticket Type'
-                    # set the issue to the proper lookup or stick with the default
-                    i.tracker = TRACKER_MAPPING[custom.Content] || DEFAULT_TRACKER
-                  else
-                    h[custom_field.id] = custom.Content
-                  end
+                  h[custom_field.id] = custom.Content
                   # count the values
                   migrated_custom_values += 1
                 end
@@ -372,7 +407,7 @@ namespace :redmine do
               
               i.custom_field_values = custom_values
               i.save_custom_field_values
-              Time.fake(ticket.LastUpdated) { i.save }
+              Time.fake(ticket.LastUpdated) { i.save! }
             end # end ticket migration
             
             # update issue id sequence if needed (postgresql)
@@ -382,14 +417,25 @@ namespace :redmine do
           
           # now that all the tickets are over, lets link them up
           RTLinks.find_each do |link|
-            # we can only link tickets that got migrated
-            #puts link.inspect
+            # we can only link tickets that got migrated, of a certain type
+            if RELATION_TYPE_MAPPING[link.Type] && TICKET_MAP[link.LocalBase] && TICKET_MAP[link.LocalTarget]
+              (IssueRelation.new :issue_from => TICKET_MAP[link.LocalBase],
+                                  :issue_to => TICKET_MAP[link.LocalTarget],
+                                  :relation_type => RELATION_TYPE_MAPPING[link.Type]).save!
+            end
+            
+            # link of 'MemberOf' Type is really a parent id for the issue
+            if link.Type == 'MemberOf' && TICKET_MAP[link.LocalBase] && TICKET_MAP[link.LocalTarget]
+              TICKET_MAP[link.LocalBase].parent_issue_id = TICKET_MAP[link.LocalTarget].id
+              TICKET_MAP[link.LocalBase].save!
+            end
+            
           end
         
         end # end transaction
         
         puts
-        puts "Tickets:         #{migrated_tickets}/#{RTTickets.count}"
+        puts "Tickets:         #{migrated_tickets}/" + RTTickets.count(:conditions => "Status != 'Deleted' ").to_s # we dont migrate deleted tickets
         puts "Ticket files:    #{migrated_ticket_attachments}/" + RTAttachments.count(:conditions => 'Filename is Not Null').to_s
         puts "Custom values:   #{migrated_custom_values}/#{RTObjectCustomFieldValues.count}"
         
@@ -413,7 +459,7 @@ namespace :redmine do
           project = Project.new :name => identifier.humanize,
                                 :description => ''
           project.identifier = identifier
-          puts "Unable to create a project with identifier '#{identifier}'!" unless project.save
+          puts "Unable to create a project with identifier '#{identifier}'!" unless project.save!
           # enable issues and wiki for the created project
           project.enabled_module_names = ['issue_tracking', 'wiki', 'time_tracking']
         else
@@ -555,9 +601,14 @@ namespace :redmine do
         rtuser = RTUsers.find_by_id(rtuserid)
         # return anonymous if not found
         return User.anonymous if !rtuser
+        # return redmine system user if that's the case
+        return User.find(:first, :conditions => {:admin => true}) if rtuser.Name == 'RT_System'
+        # return nil if it's nobody
+        return nil if rtuser.Name == 'Nobody'
         
         # search redmine for this user
         u = User.find_by_mail(rtuser.EmailAddress)
+        
         if !u
           # Create a new user if not found
           mail = rtuser.EmailAddress[0,limit_for(User, 'mail')]
@@ -574,7 +625,7 @@ namespace :redmine do
           fn = $1.strip
           ln = ($2 || '-').strip
 
-          u = User.new :mail => mail.gsub(/[^-@a-z0-9\.]/i, '-'),
+          u = User.new :mail => mail.gsub(/[^-@a-z0-9_\.]/i, '-'), # sub out invalid characters
                        :firstname => fn[0, limit_for(User, 'firstname')].gsub(/[^\w\s\'\-]/i, '-'),
                        :lastname => ln[0, limit_for(User, 'lastname')].gsub(/[^\w\s\'\-]/i, '-')
 
@@ -584,7 +635,7 @@ namespace :redmine do
           # u.admin = true if TracPermission.find_by_username_and_action(username, 'admin')
           
           # finally, a default user is used if the new user is not valid
-          u = User.find(:first) unless u.save
+          u = User.find(:first) unless u.save!
         end
         # Make sure user is a member of the project
         if project_member && !u.member_of?(@target_project)
@@ -682,8 +733,7 @@ namespace :redmine do
         def open
           # RT stores files as LBLOB, so we write that out to a tempfile
           # that can then be attached to something
-          filename = read_attribute(:Filename)
-          tf = Tempfile.open(filename) {|f| 
+          tf = Tempfile.open(sanitize_filename(read_attribute(:Filename))) {|f| 
             f.write(read_attribute(:Content))
             f.flush
             f.rewind
@@ -692,6 +742,19 @@ namespace :redmine do
             yield self
           }
         end
+        
+        private
+        # make sure we don't have problems with file names
+        def sanitize_filename(filename)
+          filename.strip.tap do |name|
+            # NOTE: File.basename doesn't work right with Windows paths on Unix
+            # get only the filename, not the whole path
+            name.sub! /\A.*(\\|\/)/, ''
+            # Finally, replace all non alphanumeric, underscore
+            # or periods with underscore
+            name.gsub! /[^\w\.\-]/, '_'
+          end
+        end
       end
       
       # used in RT simliar to Redmine related/duplicates
@@ -699,8 +762,9 @@ namespace :redmine do
         set_table_name :links
       end
     
-      # encode to proper standard
+      
       private
+        # encode to proper standard
         def self.encode(text)
           @ic.iconv text
         rescue
@@ -739,7 +803,7 @@ namespace :redmine do
     end # end def prompt
     
     DEFAULT_PORTS = {'mysql' => 3306, 'postgresql' => 5432}
-   
+
     # uses def prompt for getting/setting values
     # Don't think I need the directory
     # prompt('RT directory', :default => '/opt/rt3') {|directory| RTMigrate.set_rt_directory directory.strip}
@@ -757,6 +821,7 @@ namespace :redmine do
     prompt('RT queue name', :default => 'general') {|queue| RTMigrate.set_rt_queue queue}
     prompt('Redmine target project identifier', :default => RTMigrate.get_rt_queue) {|identifier| RTMigrate.target_project_identifier identifier}
     puts
+
     
     # now lets do the migrate
     Setting.notified_events = [] # Turn off email notifications
