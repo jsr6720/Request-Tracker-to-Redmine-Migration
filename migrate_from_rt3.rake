@@ -234,7 +234,6 @@ namespace :redmine do
               next if ticket.Status == 'deleted' # we don't migrate deleted tickets
               print '.'
               STDOUT.flush
-              puts ticket.id
               
               # create the new issue
               i = Issue.new :project => @target_project,
@@ -395,15 +394,7 @@ namespace :redmine do
               custom_values = ticket.objectcustomfieldvalues.inject({}) do |h, custom|
                 cf = RTCustomFields.find_by_id(custom.CustomField)
                 if custom_field = custom_field_map[cf.Name]
-                  
-                  # let's not blindly copy over everything
-                  case cf.Name
-                  when 'Ticket Type'
-                    # set the issue to the proper lookup or stick with the default
-                    i.tracker = TRACKER_MAPPING[custom.Content] || DEFAULT_TRACKER
-                  else
-                    h[custom_field.id] = custom.Content
-                  end
+                  h[custom_field.id] = custom.Content
                   # count the values
                   migrated_custom_values += 1
                 end
@@ -425,32 +416,35 @@ namespace :redmine do
           
           # now that all the tickets are over, lets link them up
           RTLinks.find_each do |link|
-            # we can only link tickets that got migrated, of a certain type, that aren't equal to each other
-            if (RELATION_TYPE_MAPPING[link.Type] && TICKET_MAP[link.LocalBase] && TICKET_MAP[link.LocalTarget]) &&
-                (link.LocalBase != link.LocalTarget)
+            begin
+              # we can only link tickets that got migrated, of a certain type, that aren't equal to each other
+              if (RELATION_TYPE_MAPPING[link.Type] && TICKET_MAP[link.LocalBase] && TICKET_MAP[link.LocalTarget]) &&
+                  (link.LocalBase != link.LocalTarget)
               
-              (IssueRelation.new :issue_from => TICKET_MAP[link.LocalBase],
-                                  :issue_to => TICKET_MAP[link.LocalTarget],
-                                  :relation_type => RELATION_TYPE_MAPPING[link.Type]).save!
-            end
+                (IssueRelation.new :issue_from => TICKET_MAP[link.LocalBase],
+                                    :issue_to => TICKET_MAP[link.LocalTarget],
+                                    :relation_type => RELATION_TYPE_MAPPING[link.Type]).save!
+              end
         
-            # link of 'MemberOf' Type is really a parent id for the issue
-            if link.Type == 'MemberOf' && TICKET_MAP[link.LocalBase] && TICKET_MAP[link.LocalTarget]
-              TICKET_MAP[link.LocalBase].parent_issue_id = TICKET_MAP[link.LocalTarget].id
-              TICKET_MAP[link.LocalBase].save!
-            end
+              # link of 'MemberOf' Type is really a parent id for the issue
+              if link.Type == 'MemberOf' && TICKET_MAP[link.LocalBase] && TICKET_MAP[link.LocalTarget]
+                TICKET_MAP[link.LocalBase].parent_issue_id = TICKET_MAP[link.LocalTarget].id
+                Time.fake(link.LastUpdated) { TICKET_MAP[link.LocalBase].save! }
+              end
           
-            # merged into works a little different if target and base are the same.
-            if (link.Type == 'MergedInto' && TICKET_MAP[link.Base[link.Base.rindex('/')+1..link.Base.length].to_i] && TICKET_MAP[link.LocalTarget])  &&
-                (link.LocalBase == link.LocalTarget)
-              # for whatever reason RT decided it legitimate to have a link have itself as target and base
-              # have to go the Base/Target field to find which to duplicate
+              # merged into works a little different if target and base are the same.
+              if (link.Type == 'MergedInto' && TICKET_MAP[link.Base[link.Base.rindex('/')+1..link.Base.length].to_i] && TICKET_MAP[link.LocalTarget])  &&
+                  (link.LocalBase == link.LocalTarget)
+                # for whatever reason RT decided it legitimate to have a link have itself as target and base
+                # have to go the Base/Target field to find which to duplicate
+                (IssueRelation.new :issue_from => TICKET_MAP[link.Base[link.Base.rindex('/')+1..link.Base.length].to_i],
+                                    :issue_to => TICKET_MAP[link.LocalTarget],
+                                    :relation_type => RELATION_TYPE_MAPPING[link.Type]).save!
               
-              (IssueRelation.new :issue_from => TICKET_MAP[link.Base[link.Base.rindex('/')+1..link.Base.length].to_i],
-                                  :issue_to => TICKET_MAP[link.LocalTarget],
-                                  :relation_type => RELATION_TYPE_MAPPING[link.Type]).save!
+              end
+            rescue
+              raise link.inspect
             end
-            
           end
         
         end # end transaction
@@ -645,7 +639,7 @@ namespace :redmine do
           name =~ (/(.*)(\s+\w+)?/)
           fn = $1.strip
           ln = ($2 || '-').strip
-
+          
           u = User.new :mail => mail.gsub(/[^-@a-z0-9_\.]/i, '-'), # sub out invalid characters
                        :firstname => fn[0, limit_for(User, 'firstname')].gsub(/[^\w\s\'\-]/i, '-'),
                        :lastname => ln[0, limit_for(User, 'lastname')].gsub(/[^\w\s\'\-]/i, '-')
