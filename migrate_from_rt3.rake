@@ -27,6 +27,7 @@
 #     * Role mapping from RT to Redmine
 # => counts don't make much sense at the end. verify
 # => time tracking is not ideal. if time worked set from 0 to 30, then 30 to 50, 80 min are migrated
+# => parsing html stored values, or just look for plain/text content
 
 # includes
 require 'active_record' # db access
@@ -222,7 +223,6 @@ namespace :redmine do
           # Tickets - migrate by queue
           RTQueues.find_each do |queue| # find_each
             next if queue.Name == '___Approvals' # we don't migrate this queue
-            next unless queue.Name == 'Flexo'
             # get an identifier for the queue
             prompt('Redmine target project identifier for %s queue' % queue.Name, :default => queue.Name.downcase.dasherize.gsub(/[ ]/,'-')) {|identifier| RTMigrate.target_project_identifier identifier}
             
@@ -395,7 +395,15 @@ namespace :redmine do
               custom_values = ticket.objectcustomfieldvalues.inject({}) do |h, custom|
                 cf = RTCustomFields.find_by_id(custom.CustomField)
                 if custom_field = custom_field_map[cf.Name]
-                  h[custom_field.id] = custom.Content
+                  
+                  # let's not blindly copy over everything
+                  case cf.Name
+                  when 'Ticket Type'
+                    # set the issue to the proper lookup or stick with the default
+                    i.tracker = TRACKER_MAPPING[custom.Content] || DEFAULT_TRACKER
+                  else
+                    h[custom_field.id] = custom.Content
+                  end
                   # count the values
                   migrated_custom_values += 1
                 end
@@ -417,17 +425,30 @@ namespace :redmine do
           
           # now that all the tickets are over, lets link them up
           RTLinks.find_each do |link|
-            # we can only link tickets that got migrated, of a certain type
-            if RELATION_TYPE_MAPPING[link.Type] && TICKET_MAP[link.LocalBase] && TICKET_MAP[link.LocalTarget]
+            # we can only link tickets that got migrated, of a certain type, that aren't equal to each other
+            if (RELATION_TYPE_MAPPING[link.Type] && TICKET_MAP[link.LocalBase] && TICKET_MAP[link.LocalTarget]) &&
+                (link.LocalBase != link.LocalTarget)
+              
               (IssueRelation.new :issue_from => TICKET_MAP[link.LocalBase],
                                   :issue_to => TICKET_MAP[link.LocalTarget],
                                   :relation_type => RELATION_TYPE_MAPPING[link.Type]).save!
             end
-            
+        
             # link of 'MemberOf' Type is really a parent id for the issue
             if link.Type == 'MemberOf' && TICKET_MAP[link.LocalBase] && TICKET_MAP[link.LocalTarget]
               TICKET_MAP[link.LocalBase].parent_issue_id = TICKET_MAP[link.LocalTarget].id
               TICKET_MAP[link.LocalBase].save!
+            end
+          
+            # merged into works a little different if target and base are the same.
+            if (link.Type == 'MergedInto' && TICKET_MAP[link.Base[link.Base.rindex('/')+1..link.Base.length].to_i] && TICKET_MAP[link.LocalTarget])  &&
+                (link.LocalBase == link.LocalTarget)
+              # for whatever reason RT decided it legitimate to have a link have itself as target and base
+              # have to go the Base/Target field to find which to duplicate
+              
+              (IssueRelation.new :issue_from => TICKET_MAP[link.Base[link.Base.rindex('/')+1..link.Base.length].to_i],
+                                  :issue_to => TICKET_MAP[link.LocalTarget],
+                                  :relation_type => RELATION_TYPE_MAPPING[link.Type]).save!
             end
             
           end
@@ -683,13 +704,18 @@ namespace :redmine do
         belongs_to :rtqueues
         has_many :transactions, :class_name => "RTTransactions", :foreign_key => :ObjectId
         has_many :objectcustomfieldvalues, :class_name => "RTObjectCustomFieldValues", :foreign_key => :ObjectId
+        
+        # relations
+        has_many :relations_from, :class_name => 'RTLinks', :foreign_key => 'LocalBase'
+        has_many :relations_to, :class_name => 'RTLinks', :foreign_key => 'LocalTarget'
       end
       
       # RTLinks = Redmine subtasks/related issues
       class RTLinks < ActiveRecord::Base
         set_table_name :links
         
-        belongs_to :rttickets
+        belongs_to :ticket_from, :class_name => 'RTTickets', :foreign_key => 'LocalBase'
+        belongs_to :ticket_to, :class_name => 'RTTickets', :foreign_key => 'LocalTarget'
       end
       
       # custom field vlaues for tickets (and other RT objects)
@@ -757,12 +783,6 @@ namespace :redmine do
         end
       end
       
-      # used in RT simliar to Redmine related/duplicates
-      class RTLinks < ActiveRecord::Base
-        set_table_name :links
-      end
-    
-      
       private
         # encode to proper standard
         def self.encode(text)
@@ -821,7 +841,6 @@ namespace :redmine do
     prompt('RT queue name', :default => 'general') {|queue| RTMigrate.set_rt_queue queue}
     prompt('Redmine target project identifier', :default => RTMigrate.get_rt_queue) {|identifier| RTMigrate.target_project_identifier identifier}
     puts
-
     
     # now lets do the migrate
     Setting.notified_events = [] # Turn off email notifications
