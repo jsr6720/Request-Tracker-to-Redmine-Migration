@@ -8,14 +8,5 @@ h2. Introduction
 
 This wiki maps the tables and fields in this migrate script between Request Tracker 3.8.4 and Redmine 1.0.4. Concepts that don't map directly are explained.
 
-Documented from Redmine's perspective. ie Redmine concept, what in rt will fill that void.
-
-h2. Users and Groups
-
-h3. users
-
-Each system requires logging in.
-
-|_. redmine.users 	|_. rt3.users 	|_. Description |
-|	login			
+@TODO do this at some point.
 

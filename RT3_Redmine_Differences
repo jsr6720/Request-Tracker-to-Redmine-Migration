@@ -82,7 +82,7 @@ At best comments can be made against an issue, or watch an issue.
 
 h3. Ticket Status 'delete'
 
-There is no way to *delete* an issue in Redmine short of deleting an entire project. Currently the two equivalent statuses would be *Closed* or *Rejected*.
+In RT tickets could not be deleted. A status of 'delete' only meant the ticket was hidden from the gui, but can still be accessed via direct ticket number input.
 
-In RT a ticket could have a status of *delete* and not ever be findable again except via ticket number or querying the database.
+Redmine allows deleting of an issue, and also custom statuses if we want. Assuming that delete is used in the RT system to remove extraneous tickets they are not migrated.
 
