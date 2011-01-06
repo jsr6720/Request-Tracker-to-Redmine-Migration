@@ -163,7 +163,6 @@ namespace :redmine do
         attempted_migrated_ticket_attachments = 0
         migrated_ticket_attachments = 0
         
-        Issue.delete_all
         puts 'migrating data'
         # lets do a transaction
         ActiveRecord::Base.transaction do
