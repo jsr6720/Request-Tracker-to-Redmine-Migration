@@ -28,6 +28,7 @@
 # => counts don't make much sense at the end. verify
 # => time tracking is not ideal. if time worked set from 0 to 30, then 30 to 50, 80 min are migrated
 # => parsing html stored values, or just look for plain/text content
+# => use RedCloth for html to textile instead of html2textile
 
 # includes
 require 'active_record' # db access
@@ -36,14 +37,7 @@ require 'pp'
 require 'tempfile'
 
 # convert html to textile
-if Gem.available?('html2textile')
-  require 'html2textile'
-else
-  print "WARNING: html2textile gem not found, do you want to continue? (RT content transfered as html text) [y/N] "
-  STDOUT.flush
-  break unless STDIN.gets.match(/^y$/i)
-  puts
-end
+if Gem.available?('html2textile') then require 'html2textile'
 
 namespace :redmine do
   desc "Migrate from RT3 to Redmine"
@@ -795,6 +789,14 @@ namespace :redmine do
       exit
     else
       puts "Redmine configuration found. Moving on."
+    end
+    
+    # convert html to textile
+    if !Gem.available?('html2textile')
+      print "WARNING: html2textile gem not found, do you want to continue? (RT content transfered as html text) [y/N] "
+      STDOUT.flush
+      break unless STDIN.gets.match(/^y$/i)
+      puts
     end
     
   # give the user one last chance to quit
