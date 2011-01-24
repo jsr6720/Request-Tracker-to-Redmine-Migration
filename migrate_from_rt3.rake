@@ -37,7 +37,7 @@ require 'pp'
 require 'tempfile'
 
 # convert html to textile
-if Gem.available?('html2textile') then require 'html2textile'
+if Gem.available?('html2textile') then require 'html2textile' end
 
 namespace :redmine do
   desc "Migrate from RT3 to Redmine"
@@ -792,7 +792,7 @@ namespace :redmine do
     end
     
     # convert html to textile
-    if !Gem.available?('html2textile')
+    if !Gem.available?('html2textile') then
       print "WARNING: html2textile gem not found, do you want to continue? (RT content transfered as html text) [y/N] "
       STDOUT.flush
       break unless STDIN.gets.match(/^y$/i)
@@ -820,8 +820,6 @@ namespace :redmine do
     DEFAULT_PORTS = {'mysql' => 3306, 'postgresql' => 5432}
 
     # uses def prompt for getting/setting values
-    # Don't think I need the directory
-    # prompt('RT directory', :default => '/opt/rt3') {|directory| RTMigrate.set_rt_directory directory.strip}
     prompt('RT database adapter (sqlite, sqlite3, mysql, postgresql)', :default => 'mysql') {|adapter| RTMigrate.set_rt_adapter adapter}
     unless %w(sqlite sqlite3).include?(RTMigrate.rt_adapter)
       # we need more info if it's not sqlite3
@@ -833,8 +831,6 @@ namespace :redmine do
       prompt('RT database password') {|password| RTMigrate.set_rt_db_password password}
     end
     prompt('RT database encoding', :default => 'UTF-8') {|encoding| RTMigrate.encoding encoding}
-    prompt('RT queue name', :default => 'general') {|queue| RTMigrate.set_rt_queue queue}
-    prompt('Redmine target project identifier', :default => RTMigrate.get_rt_queue) {|identifier| RTMigrate.target_project_identifier identifier}
     puts
     
     # now lets do the migrate
