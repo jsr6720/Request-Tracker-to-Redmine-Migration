@@ -1,0 +1,28 @@
+Because why not? I don't claim copyright.
+
+DALL·E
+
+User
+hey can you create a GitHub social preview image 1280px×640px that was a ruby script used to migrate data from request tracker to redmine?
+GPT
+A visually appealing social preview image for GitHub, featuring a computer screen displaying a Ruby script used to migrate data from Request Tracker to Redmine. The screen is set against a modern, tech-themed background with digital motifs and subtle hints of coding elements. The script on the screen should be partially visible, showing lines of Ruby code, with keywords like 'migrate', 'data', 'Request Tracker', and 'Redmine' emphasized. The overall color scheme includes shades of blue and red, representing Ruby and Redmine respectively. Size: 1280px by 640px.
+A visually appealing social preview image for GitHub, featuring a computer screen displaying a Ruby script used to migrate data from Request Tracker to Redmine. The screen is set against a modern, tech-themed background with digital motifs and subtle hints of coding elements. The script on the screen should be partially visible, showing lines of Ruby code, with keywords like 'migrate', 'data', 'Request Tracker', and 'Redmine' emphasized. The overall color scheme includes shades of blue and red, representing Ruby and Redmine respectively. Size: 1280px by 640px.
+Here are two social preview images for GitHub, featuring a Ruby script used to migrate data from Request Tracker to Redmine. You can view and download your preferred version from the displayed options.
+User
+no. how about a water color incorporating the gemstone ruby and tickets
+GPT
+A watercolor painting featuring the gemstone ruby and tickets. The composition includes a vibrant, deep red ruby placed centrally, its facets glistening with light. Surrounding the ruby, there are scattered tickets, each detailed with intricate designs and slightly curled edges, suggesting a blend of mystery and allure. The background should be soft and washed out, with gentle splashes of color that enhance the gemstone and tickets, providing a dreamy and artistic feel. The overall tone of the painting should evoke a sense of timeless beauty and enchantment.
+A watercolor painting featuring the gemstone ruby and tickets. The composition includes a vibrant, deep red ruby placed centrally, its facets glistening with light. Surrounding the ruby, there are scattered tickets, each detailed with intricate designs and slightly curled edges, suggesting a blend of mystery and allure. The background should be soft and washed out, with gentle splashes of color that enhance the gemstone and tickets, providing a dreamy and artistic feel. The overall tone of the painting should evoke a sense of timeless beauty and enchantment.
+Here are two watercolor images incorporating the gemstone ruby and tickets. You can choose your preferred image from the options displayed.
+User
+better, but not tickets like train tickets. support tickets like it support desk
+GPT
+A watercolor painting featuring the gemstone ruby and IT support tickets. The painting shows a vibrant, deep red ruby placed centrally, its facets shimmering. Around the ruby, there are several support tickets, depicted as floating pieces of paper with computer icons and digital text, resembling IT support requests. These tickets should look ethereal and slightly transparent, mingling with digital motifs in the background. The background itself is soft and contains light digital patterns, suggesting a connection between the gemstone and the world of technology.
+A watercolor painting featuring the gemstone ruby and IT support tickets. The painting shows a vibrant, deep red ruby placed centrally, its facets shimmering. Around the ruby, there are several support tickets, depicted as floating pieces of paper with computer icons and digital text, resembling IT support requests. These tickets should look ethereal and slightly transparent, mingling with digital motifs in the background. The background itself is soft and contains light digital patterns, suggesting a connection between the gemstone and the world of technology.
+Here are two watercolor images featuring the gemstone ruby and IT support tickets. You can choose your preferred image from the options displayed.
+User
+Edited image
+I love it but set the resolution to 1280x640 pixels
+GPT
+A watercolor painting featuring the gemstone ruby and IT support tickets, resized to 1280x640 pixels. The painting shows a vibrant, deep red ruby placed centrally, its facets shimmering. Around the ruby, there are several support tickets, depicted as floating pieces of paper with computer icons and digital text, resembling IT support requests. These tickets should look ethereal and slightly transparent, mingling with digital motifs in the background. The background itself is soft and contains light digital patterns, suggesting a connection between the gemstone and the world of technology.
+Here's the watercolor image featuring the gemstone ruby and IT support tickets, resized to 1280x640 pixels. You can view and download the image from the display.
